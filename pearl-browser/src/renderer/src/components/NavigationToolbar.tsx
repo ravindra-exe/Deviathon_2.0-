@@ -2,14 +2,20 @@ import type { BrowserTabState } from '../../../shared/browser'
 
 interface NavigationToolbarProps {
   activeTab?: BrowserTabState
+  isBookmarked: boolean
   onCommand: (type: 'go-back' | 'go-forward' | 'reload' | 'stop-loading') => void
   onNavigate: (value: string) => void
+  onBookmark: () => void
+  onPanel: (panel: 'bookmarks' | 'history' | 'downloads' | 'settings') => void
 }
 
 export function NavigationToolbar({
   activeTab,
+  isBookmarked,
   onCommand,
-  onNavigate
+  onNavigate,
+  onBookmark,
+  onPanel
 }: NavigationToolbarProps): React.JSX.Element {
   const submit = (event: React.FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
@@ -56,7 +62,25 @@ export function NavigationToolbar({
         </button>
       </form>
       <div className="toolbar-spacer" />
-      <span className="engine-label">Google search</span>
+      <button
+        className={`toolbar-button ${isBookmarked ? 'bookmarked' : ''}`}
+        onClick={onBookmark}
+        aria-label={isBookmarked ? 'Bookmarked' : 'Add bookmark'}
+      >
+        {isBookmarked ? '★' : '☆'}
+      </button>
+      <button className="toolbar-button" onClick={() => onPanel('bookmarks')}>
+        Bookmarks
+      </button>
+      <button className="toolbar-button" onClick={() => onPanel('history')}>
+        History
+      </button>
+      <button className="toolbar-button" onClick={() => onPanel('downloads')}>
+        Downloads
+      </button>
+      <button className="toolbar-button" onClick={() => onPanel('settings')}>
+        Settings
+      </button>
     </div>
   )
 }

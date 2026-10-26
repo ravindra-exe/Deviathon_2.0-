@@ -12,6 +12,4 @@ const browser: BrowserAPI = {
   }
 }
 
-if (process.contextIsolated) {
-  contextBridge.exposeInMainWorld('browser', browser)
-}
+if (process.contextIsolated) contextBridge.exposeInMainWorld('browser', browser)

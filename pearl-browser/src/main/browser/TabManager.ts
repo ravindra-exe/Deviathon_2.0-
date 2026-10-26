@@ -1,5 +1,5 @@
 import { BrowserWindow, WebContentsView } from 'electron'
-import type { BrowserState, BrowserTabState } from '../../shared/browser'
+import type { BrowserTabState, BrowserTabsState } from '../../shared/browser'
 import { NavigationService } from './NavigationService'
 
 const NEW_TAB_URL = 'https://www.google.com'
@@ -7,6 +7,7 @@ const NEW_TAB_URL = 'https://www.google.com'
 interface ManagedTab {
   state: BrowserTabState
   view: WebContentsView
+  pendingVisitUrl?: string
 }
 
 export class TabManager {
@@ -17,7 +18,8 @@ export class TabManager {
   constructor(
     private readonly window: BrowserWindow | Electron.BaseWindow,
     private readonly navigation: NavigationService,
-    private readonly onChange: () => void
+    private readonly onChange: () => void,
+    private readonly onVisit: (tab: BrowserTabState) => void
   ) {}
 
   createTab(input = NEW_TAB_URL): string {
@@ -102,15 +104,14 @@ export class TabManager {
 
   resize(width: number, height: number): void {
     for (const tab of this.tabs.values()) {
-      tab.view.setBounds({ x: 0, y: 118, width, height: Math.max(0, height - 118) })
+      tab.view.setBounds({ x: 0, y: 156, width, height: Math.max(0, height - 156) })
     }
   }
 
-  getState(): BrowserState {
+  getState(): BrowserTabsState {
     return {
       tabs: [...this.tabs.values()].map(({ state }) => ({ ...state })),
-      activeTabId: this.activeTabId,
-      searchEngineUrl: this.navigation.searchEngineUrl
+      activeTabId: this.activeTabId
     }
   }
 
@@ -132,6 +133,10 @@ export class TabManager {
     webContents.on('did-stop-loading', () => {
       tab.state.isLoading = false
       this.syncState(tab)
+      if (tab.pendingVisitUrl && tab.pendingVisitUrl === tab.state.url) {
+        this.onVisit({ ...tab.state })
+        tab.pendingVisitUrl = undefined
+      }
     })
     webContents.on('page-title-updated', (event, title) => {
       event.preventDefault()
@@ -142,7 +147,10 @@ export class TabManager {
       tab.state.favicon = favicons[0]
       this.onChange()
     })
-    webContents.on('did-navigate', () => this.syncState(tab))
+    webContents.on('did-navigate', () => {
+      tab.pendingVisitUrl = tab.view.webContents.getURL()
+      this.syncState(tab)
+    })
     webContents.on('did-navigate-in-page', () => this.syncState(tab))
     webContents.on(
       'did-fail-load',
@@ -168,10 +176,24 @@ export class TabManager {
   }
 
   private syncState(tab: ManagedTab): void {
+    const previousUrl = tab.state.url
     tab.state.url = tab.view.webContents.getURL()
     tab.state.canGoBack = tab.view.webContents.navigationHistory.canGoBack()
     tab.state.canGoForward = tab.view.webContents.navigationHistory.canGoForward()
     tab.state.isLoading = false
+    if (tab.state.url !== previousUrl && !this.navigation.isWebUrl(tab.state.url))
+      tab.pendingVisitUrl = undefined
     this.onChange()
+  }
+
+  getRestorableSession(): { urls: string[]; activeUrl?: string } {
+    const tabs = [...this.tabs.values()]
+      .map(({ state }) => state.url)
+      .filter((url) => this.navigation.isWebUrl(url))
+    const activeUrl = this.activeTab?.state.url
+    return {
+      urls: tabs,
+      activeUrl: activeUrl && this.navigation.isWebUrl(activeUrl) ? activeUrl : undefined
+    }
   }
 }

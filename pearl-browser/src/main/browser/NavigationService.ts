@@ -1,8 +1,15 @@
 import { shell } from 'electron'
+import type { SearchEngine } from '../../shared/browser'
 
-const SEARCH_ENGINE_URL = 'https://www.google.com/search?q='
+export const SEARCH_ENGINES: SearchEngine[] = [
+  { id: 'google', label: 'Google', searchUrl: 'https://www.google.com/search?q=' },
+  { id: 'bing', label: 'Bing', searchUrl: 'https://www.bing.com/search?q=' },
+  { id: 'duckduckgo', label: 'DuckDuckGo', searchUrl: 'https://duckduckgo.com/?q=' }
+]
 
 export class NavigationService {
+  constructor(private searchEngine: SearchEngine['id'] = 'google') {}
+
   normalize(input: string): string {
     const value = input.trim()
     if (!value) {
@@ -19,7 +26,7 @@ export class NavigationService {
       // Treat malformed input as a search query.
     }
 
-    return `${SEARCH_ENGINE_URL}${encodeURIComponent(value)}`
+    return `${this.searchEngineDefinition.searchUrl}${encodeURIComponent(value)}`
   }
 
   isWebUrl(value: string): boolean {
@@ -34,8 +41,10 @@ export class NavigationService {
   openExternal(value: string): void {
     try {
       const url = new URL(value)
-      if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      if (url.protocol === 'mailto:' || url.protocol === 'tel:') {
         void shell.openExternal(value)
+      } else {
+        console.warn('Blocked unsupported external protocol:', url.protocol)
       }
     } catch {
       console.warn('Blocked malformed external URL:', value)
@@ -43,6 +52,18 @@ export class NavigationService {
   }
 
   get searchEngineUrl(): string {
-    return SEARCH_ENGINE_URL
+    return this.searchEngineDefinition.searchUrl
+  }
+
+  get searchEngineId(): SearchEngine['id'] {
+    return this.searchEngine
+  }
+
+  setSearchEngine(engine: SearchEngine['id']): void {
+    if (SEARCH_ENGINES.some((candidate) => candidate.id === engine)) this.searchEngine = engine
+  }
+
+  private get searchEngineDefinition(): SearchEngine {
+    return SEARCH_ENGINES.find((engine) => engine.id === this.searchEngine) ?? SEARCH_ENGINES[0]
   }
 }
