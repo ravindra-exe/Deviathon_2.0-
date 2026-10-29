@@ -30,7 +30,8 @@ const tab = (url: string, title = 'Example'): BrowserTabState => ({
   title,
   isLoading: false,
   canGoBack: false,
-  canGoForward: false
+  canGoForward: false,
+  navigationState: 'loaded'
 })
 
 describe('BrowserDataService', () => {

@@ -12,3 +12,7 @@ Known limitations:
 - Download resume depends on Electron and server support; cancelled or interrupted downloads are not guaranteed to resume.
 - Popup requests are denied rather than offered as a new tab.
 - Navigation errors are represented by tab metadata and the Chromium error page; a dedicated local error surface can be added later.
+- Milestone 3 adds a local demonstration assessment foundation with main-process state, a replaceable provider, MCQ answers, a trusted desktop deadline display, policy checks, and an event record. It intentionally does not include webcams, AI monitoring, production identity verification, backend submission, or tamper-proof enforcement.
+- Phase 2 adds main-process assessment navigation policy evaluation for configured HTTPS host allowlists, explicit local-development exceptions, history-target validation, popup/new-tab restrictions, and blocked-action event records. It does not restrict other operating-system applications or external devices and has no real examination backend.
+- Task 4 adds an optional separately runnable Airtable-backed MCQ service and explicit remote provider mode. The local demo remains available; production authentication, deployment hardening, and real credential verification are still required.
+- Development remote mode now supports short-lived, single-attempt enrollment tokens for local integration testing only. These tokens are not participant identity verification; production OTP/OIDC or equivalent authentication remains release-blocking.

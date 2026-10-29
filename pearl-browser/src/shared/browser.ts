@@ -1,3 +1,5 @@
+import type { AssessmentAPI } from './assessment'
+
 export interface BrowserTabState {
   id: string
   title: string
@@ -6,7 +8,13 @@ export interface BrowserTabState {
   isLoading: boolean
   canGoBack: boolean
   canGoForward: boolean
+  errorCode?: number
+  errorMessage?: string
+  failedUrl?: string
+  navigationState: NavigationState
 }
+
+export type NavigationState = 'idle' | 'loading' | 'loaded' | 'failed' | 'recovering'
 
 export interface Bookmark {
   id: string
@@ -86,9 +94,12 @@ export type BrowserCommand =
   | { type: 'pause-download'; downloadId: string }
   | { type: 'resume-download'; downloadId: string }
   | { type: 'show-download-folder'; downloadId: string }
+  | { type: 'set-panel-open'; open: boolean }
 
 export interface BrowserAPI {
   getState(): Promise<BrowserState>
   command(command: BrowserCommand): Promise<BrowserState>
   onStateChange(listener: (state: BrowserState) => void): () => void
+  onFocusAddress(listener: () => void): () => void
+  assessment: AssessmentAPI
 }

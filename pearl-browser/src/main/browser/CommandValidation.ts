@@ -31,6 +31,8 @@ export function isBrowserCommand(value: unknown): value is BrowserCommand {
     case 'set-history-enabled':
     case 'set-restore-session':
       return typeof command.enabled === 'boolean'
+    case 'set-panel-open':
+      return typeof command.open === 'boolean'
     case 'set-search-engine':
       return typeof command.engineId === 'string' && isSearchEngine(command.engineId)
     case 'go-back':

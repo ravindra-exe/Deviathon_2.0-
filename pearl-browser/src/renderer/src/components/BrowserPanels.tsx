@@ -30,10 +30,15 @@ export function BrowserPanels({
   if (!panel) return null
 
   return (
-    <section className="browser-panel" aria-label={`${panel} panel`}>
+    <section className="browser-panel" aria-label={`${panel} panel`} role="dialog">
       <div className="panel-heading">
         <h2>{panel[0].toUpperCase() + panel.slice(1)}</h2>
-        <button className="icon-button" onClick={onClose} aria-label="Close panel">
+        <button
+          className="icon-button"
+          onClick={onClose}
+          aria-label="Close panel"
+          title="Close panel"
+        >
           ×
         </button>
       </div>

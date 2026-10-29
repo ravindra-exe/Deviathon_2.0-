@@ -2,12 +2,18 @@ import { app, BaseWindow, ipcMain, session, WebContentsView } from 'electron'
 import { join } from 'node:path'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import type { BrowserCommand, BrowserState } from '../shared/browser'
+import type { AssessmentActivityEvent } from '../shared/assessment'
 import { isBrowserCommand } from './browser/CommandValidation'
 import { DownloadManager } from './browser/DownloadManager'
 import { BrowserDataService } from './browser/BrowserDataService'
 import { NavigationService } from './browser/NavigationService'
 import { PersistenceService } from './browser/PersistenceService'
 import { TabManager } from './browser/TabManager'
+import type { BrowserShortcut } from './browser/TabManager'
+import { calculateBrowserLayout } from './browser/Layout'
+import { AssessmentManager } from './browser/AssessmentManager'
+import { LocalDemoAssessmentProvider } from './browser/AssessmentProvider'
+import { RemoteAssessmentProvider } from './browser/RemoteAssessmentProvider'
 
 let mainWindow: BaseWindow | undefined
 let chromeView: WebContentsView | undefined
@@ -16,6 +22,7 @@ let persistence: PersistenceService | undefined
 let downloads: DownloadManager | undefined
 let navigation: NavigationService | undefined
 let browserData: BrowserDataService | undefined
+let assessment: AssessmentManager | undefined
 
 function isChromeSender(event: Electron.IpcMainInvokeEvent): boolean {
   return event.sender === chromeView?.webContents
@@ -26,6 +33,19 @@ function createWindow(): void {
   const saved = persistence.snapshot
   navigation = new NavigationService(saved.preferences.searchEngineId)
   browserData = new BrowserDataService(persistence, navigation)
+  const assessmentProvider =
+    process.env['PEARL_ASSESSMENT_PROVIDER'] === 'remote'
+      ? new RemoteAssessmentProvider({
+          baseUrl: process.env['PEARL_ASSESSMENT_BACKEND_URL'] ?? '',
+          assessmentId: process.env['PEARL_ASSESSMENT_ID'] ?? '',
+          useDevelopmentEnrollment: process.env['PEARL_ASSESSMENT_DEV_ENROLLMENT'] === 'true'
+        })
+      : new LocalDemoAssessmentProvider()
+  assessment = new AssessmentManager(assessmentProvider, (state) => {
+    if (chromeView && !chromeView.webContents.isDestroyed()) {
+      chromeView.webContents.send('assessment-state', state)
+    }
+  })
   mainWindow = new BaseWindow({ width: 1200, height: 800, autoHideMenuBar: true })
   chromeView = new WebContentsView({
     webPreferences: {
@@ -45,19 +65,56 @@ function createWindow(): void {
         data.session = tabs?.getRestorableSession() ?? { urls: [] }
       })
     }
-    if (mainWindow && chromeView) mainWindow.contentView.addChildView(chromeView)
+    const activeTab = tabs?.getState().tabs.find((tab) => tab.id === tabs?.getState().activeTabId)
+    if ((activeTab?.errorMessage || activeTab?.url === 'about:blank') && mainWindow && chromeView) {
+      mainWindow.contentView.addChildView(chromeView)
+    } else {
+      tabs?.bringViewsToFront()
+    }
     if (chromeView && !chromeView.webContents.isDestroyed())
       chromeView.webContents.send('browser-state', getState())
   }
-  tabs = new TabManager(mainWindow, navigation, emitChange, (tab) => {
-    browserData?.recordVisit(tab)
-  })
+  tabs = new TabManager(
+    mainWindow,
+    navigation,
+    emitChange,
+    (tab) => browserData?.recordVisit(tab),
+    (shortcut: BrowserShortcut) => {
+      switch (shortcut) {
+        case 'focus-address':
+          chromeView?.webContents.focus()
+          chromeView?.webContents.send('browser-focus-address')
+          break
+        case 'new-tab':
+          tabs?.createTab()
+          break
+        case 'close-tab':
+          if (tabs) tabs.closeTab(tabs.getState().activeTabId)
+          break
+        case 'reload':
+          tabs?.reload()
+          break
+        case 'back':
+          tabs?.goBack()
+          break
+        case 'forward':
+          tabs?.goForward()
+          break
+      }
+    },
+    (url) => assessment?.canNavigate(url) ?? true,
+    () => assessment?.canCreateTab() ?? true,
+    undefined,
+    (event) => {
+      void assessment?.recordActivityEvent(event)
+    }
+  )
   downloads = new DownloadManager(mainWindow, persistence, emitChange)
 
   const updateBounds = (): void => {
     if (!mainWindow || !chromeView) return
     const [width, height] = mainWindow.getContentSize()
-    chromeView.setBounds({ x: 0, y: 0, width, height })
+    chromeView.setBounds(calculateBrowserLayout(width, height).chrome)
     tabs?.resize(width, height)
   }
   mainWindow.on('resize', updateBounds)
@@ -71,6 +128,7 @@ function createWindow(): void {
     downloads?.dispose()
     tabs = undefined
     downloads = undefined
+    assessment = undefined
     chromeView = undefined
     mainWindow = undefined
   })
@@ -113,6 +171,107 @@ function getState(): BrowserState {
 ipcMain.handle('browser:get-state', (event) => {
   if (!isChromeSender(event)) throw new Error('Unauthorized browser state request')
   return getState()
+})
+
+function isAssessmentSender(event: Electron.IpcMainInvokeEvent): boolean {
+  return event.sender === chromeView?.webContents
+}
+
+function getAssessment(): AssessmentManager {
+  if (!assessment) throw new Error('Assessment is not ready')
+  return assessment
+}
+
+function isActivityEvent(value: unknown): value is AssessmentActivityEvent {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const event = value as Record<string, unknown>
+  const types = [
+    'navigation_started',
+    'navigation_completed',
+    'search_performed',
+    'ai_assistance_domain_visited',
+    'tab_created',
+    'tab_closed',
+    'tab_switched',
+    'popup_blocked',
+    'navigation_blocked',
+    'redirect_observed',
+    'camera_started',
+    'camera_permission_denied',
+    'camera_unavailable',
+    'face_not_detected',
+    'face_detected',
+    'multiple_faces_detected',
+    'camera_disconnected'
+  ]
+  if (typeof event.type !== 'string' || !types.includes(event.type)) return false
+  return ['hostname', 'url', 'query'].every(
+    (key) =>
+      event[key] === undefined || (typeof event[key] === 'string' && event[key].length <= 512)
+  )
+}
+
+ipcMain.handle('assessment:get-state', (event) => {
+  if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment state request')
+  return getAssessment().getState()
+})
+ipcMain.handle('assessment:start', async (event) => {
+  if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment request')
+  return getAssessment().start()
+})
+ipcMain.handle(
+  'assessment:authenticate',
+  async (event, displayName: unknown, demoCode: unknown) => {
+    if (
+      !isAssessmentSender(event) ||
+      typeof displayName !== 'string' ||
+      typeof demoCode !== 'string'
+    ) {
+      throw new Error('Invalid assessment authentication request')
+    }
+    return getAssessment().authenticate(displayName.slice(0, 100), demoCode.slice(0, 32))
+  }
+)
+ipcMain.handle('assessment:request-otp', async (event, email: unknown) => {
+  if (!isAssessmentSender(event) || typeof email !== 'string') {
+    throw new Error('Invalid OTP request')
+  }
+  return getAssessment().requestOtp(email.slice(0, 254))
+})
+ipcMain.handle('assessment:begin', async (event) => {
+  if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment request')
+  return getAssessment().begin()
+})
+ipcMain.handle('assessment:answer', (event, questionId: unknown, optionIndex: unknown) => {
+  if (
+    !isAssessmentSender(event) ||
+    typeof questionId !== 'string' ||
+    questionId.length > 128 ||
+    typeof optionIndex !== 'number'
+  ) {
+    throw new Error('Invalid assessment answer request')
+  }
+  return getAssessment().answer(questionId, optionIndex)
+})
+ipcMain.handle('assessment:go-to-question', (event, index: unknown) => {
+  if (!isAssessmentSender(event) || typeof index !== 'number') {
+    throw new Error('Invalid assessment navigation request')
+  }
+  return getAssessment().goToQuestion(index)
+})
+ipcMain.handle('assessment:submit', async (event) => {
+  if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment request')
+  return getAssessment().submit()
+})
+ipcMain.handle('assessment:cancel', (event) => {
+  if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment request')
+  return getAssessment().cancel()
+})
+ipcMain.handle('assessment:record-activity', async (event, value: unknown) => {
+  if (!isAssessmentSender(event) || !isActivityEvent(value)) {
+    throw new Error('Invalid assessment activity event')
+  }
+  return getAssessment().recordActivityEvent(value)
 })
 
 ipcMain.handle('browser:command', (event, command: BrowserCommand) => {
@@ -185,6 +344,15 @@ ipcMain.handle('browser:command', (event, command: BrowserCommand) => {
         if (!command.enabled) data.session = { urls: [] }
       })
       break
+    case 'set-panel-open':
+      if (command.open) {
+        if (mainWindow && chromeView) {
+          mainWindow.contentView.addChildView(chromeView)
+        }
+      } else {
+        tabs.bringViewsToFront()
+      }
+      break
     case 'cancel-download':
       downloads.cancel(command.downloadId)
       break
@@ -213,6 +381,14 @@ app.whenReady().then(() => {
     })
   }
   app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
+  app.on('certificate-error', (_event, _webContents, url, error, _certificate, callback) => {
+    callback(false)
+    try {
+      console.warn(`Certificate validation failed for ${new URL(url).origin}: ${error}`)
+    } catch {
+      console.warn(`Certificate validation failed for an invalid URL: ${error}`)
+    }
+  })
   session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
     callback(false)
   )

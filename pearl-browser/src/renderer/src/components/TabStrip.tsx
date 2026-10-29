@@ -17,7 +17,12 @@ export function TabStrip({
 }: TabStripProps): React.JSX.Element {
   return (
     <div className="tab-strip">
-      <div className="brand-mark">pearl</div>
+      <div className="brand-mark" aria-label="Pearl Browser">
+        <span className="brand-mark-orbit" aria-hidden="true">
+          <span />
+        </span>
+        <span className="brand-mark-word">PEARL</span>
+      </div>
       <div className="tabs" role="tablist">
         {tabs.map((tab) => (
           <div
@@ -42,6 +47,7 @@ export function TabStrip({
             <button
               className="icon-button tab-close"
               aria-label={`Close ${tab.title}`}
+              title={`Close ${tab.title}`}
               onClick={(event) => {
                 event.stopPropagation()
                 onClose(tab.id)
@@ -52,7 +58,7 @@ export function TabStrip({
           </div>
         ))}
       </div>
-      <button className="icon-button new-tab" onClick={onNew} aria-label="New tab">
+      <button className="icon-button new-tab" onClick={onNew} aria-label="New tab" title="New tab">
         +
       </button>
     </div>

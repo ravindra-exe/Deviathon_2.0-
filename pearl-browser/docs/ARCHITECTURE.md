@@ -7,10 +7,35 @@ Pearl uses a trusted desktop process and two kinds of renderer content:
 - Each tab is an independent sandboxed `WebContentsView` with no preload bridge.
 - Shared contracts live in `src/shared/browser.ts`, keeping future modules independent of React and Chromium navigation.
 
-The window's chrome view occupies the first 156 pixels. Tab views are resized below it and only the active view is visible. State changes from Chromium are sent to the local chrome over a sender-validated IPC channel.
+The window's chrome view occupies the first 112 pixels in the normal two-row shell. Tab views are resized below it and only the active view is visible. For a local new-tab state or a main-frame navigation error, the chrome view is intentionally raised over the content view so the user gets a usable search or retry surface. State changes from Chromium are sent to the local chrome over a sender-validated IPC channel.
+
+Each tab exposes a typed `navigationState` (`idle`, `loading`, `loaded`, `failed`, or
+`recovering`). `TabManager` updates it only for main-frame events, ignores cancelled
+and subframe failures, and clears failures after `did-finish-load`. The error surface
+is rendered by the local React chrome rather than by loading error HTML into a remote
+or privileged page. Retry re-enters the normal validated navigation path.
 
 `PersistenceService` owns a versioned, validated JSON store in Electron's user-data directory and writes through a temporary file before renaming. `DownloadManager` owns live `DownloadItem` objects and persists metadata only. Bookmarks, history, preferences, downloads, and optional URL-only session restoration are exposed through shared contracts and allowlisted IPC commands.
 
 `BrowserDataService` keeps bookmark and history mutations out of React and navigation code. Vitest tests use injected storage paths and download event dependencies, while production continues to use Electron's real session and dialog services.
 
 Future extension points can add profile-specific storage or richer download policies beside these services. Assessment, AI, webcam analysis, and activity monitoring are intentionally out of scope.
+
+The assessment foundation is a separate main-process `AssessmentManager` with a replaceable provider interface and a local demonstration provider. Its state machine, deadline, answers, policy checks, and event record are authoritative in the main process; the React assessment surface only submits validated actions through the restricted preload bridge. Expiration uses a per-session generation guard so delayed callbacks from an earlier session cannot expire a newer one. Closing or cancelling the application does not persist an in-progress assessment or resume its deadline; a production assessment must use an authoritative backend. The local provider is explicitly a prototype and does not provide production identity verification or tamper resistance.
+
+Assessment navigation policy decisions are evaluated in the main process by
+`AssessmentNavigationPolicy.ts`. Active assessment navigation is HTTPS-only and
+uses exact host matching with optional explicit subdomains. Local HTTP exceptions,
+new tabs, and popup destinations require explicit policy configuration. Address-bar
+navigation, webpage navigation events, programmatic loads, history targets, and
+tab creation are checked before use; the policy does not depend on React or remote
+webpage messages.
+
+The optional remote assessment path is a separately runnable Fastify backend.
+Its Airtable client, validation, and routes live under `backend/`; Electron
+uses only a typed HTTP provider from the main process. The local demo provider
+remains the default. Remote configuration is explicit, and backend failures
+produce an assessment failure rather than an implicit local fallback. The
+backend enforces the attempt deadline from `StartedAt` and the published
+duration; remote participant display names remain unverified demo identity until
+a future authentication integration is added.
