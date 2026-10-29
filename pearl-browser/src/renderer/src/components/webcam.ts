@@ -5,7 +5,10 @@ export function shouldPublishCameraState(previous: string, next: string): boolea
 }
 
 export function cameraErrorState(error: unknown): 'permission_denied' | 'unavailable' {
-  const name = error instanceof DOMException ? error.name : ''
+  const name =
+    error && typeof error === 'object' && 'name' in error && typeof error.name === 'string'
+      ? error.name
+      : ''
   return name === 'NotAllowedError' || name === 'SecurityError'
     ? 'permission_denied'
     : 'unavailable'

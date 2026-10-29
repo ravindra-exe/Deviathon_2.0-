@@ -1,8 +1,9 @@
-import { app, BaseWindow, ipcMain, session, WebContentsView } from 'electron'
+import { app, BaseWindow, ipcMain, session, systemPreferences, WebContentsView } from 'electron'
 import { join } from 'node:path'
+import { config as loadDotenv } from 'dotenv'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import type { BrowserCommand, BrowserState } from '../shared/browser'
-import type { AssessmentActivityEvent } from '../shared/assessment'
+import type { AssessmentActivityEvent, AssessmentSession } from '../shared/assessment'
 import { isBrowserCommand } from './browser/CommandValidation'
 import { DownloadManager } from './browser/DownloadManager'
 import { BrowserDataService } from './browser/BrowserDataService'
@@ -23,6 +24,35 @@ let downloads: DownloadManager | undefined
 let navigation: NavigationService | undefined
 let browserData: BrowserDataService | undefined
 let assessment: AssessmentManager | undefined
+let liveAssessment: AssessmentManager | undefined
+let demoAssessment: AssessmentManager | undefined
+let assessmentSurfaceVisible = false
+let cameraConsentAttemptId: string | undefined
+let cameraConsentSessionKey: string | undefined
+let cameraPermissionSessionKey: string | undefined
+let cameraReadySessionKey: string | undefined
+let assessmentBeginInFlight = false
+
+function getLiveCameraSessionKey(state: AssessmentSession): string | undefined {
+  const configuration = state.configuration
+  const participant = state.participant
+  if (
+    configuration?.provider !== 'remote-backend' ||
+    configuration.policy.cameraMonitoring !== true ||
+    !participant ||
+    participant.demoOnly
+  ) {
+    return undefined
+  }
+  return `${configuration.id}:${participant.id}`
+}
+
+function clearCameraAuthorization(): void {
+  cameraConsentAttemptId = undefined
+  cameraConsentSessionKey = undefined
+  cameraPermissionSessionKey = undefined
+  cameraReadySessionKey = undefined
+}
 
 function isChromeSender(event: Electron.IpcMainInvokeEvent): boolean {
   return event.sender === chromeView?.webContents
@@ -33,19 +63,36 @@ function createWindow(): void {
   const saved = persistence.snapshot
   navigation = new NavigationService(saved.preferences.searchEngineId)
   browserData = new BrowserDataService(persistence, navigation)
-  const assessmentProvider =
-    process.env['PEARL_ASSESSMENT_PROVIDER'] === 'remote'
-      ? new RemoteAssessmentProvider({
-          baseUrl: process.env['PEARL_ASSESSMENT_BACKEND_URL'] ?? '',
-          assessmentId: process.env['PEARL_ASSESSMENT_ID'] ?? '',
-          useDevelopmentEnrollment: process.env['PEARL_ASSESSMENT_DEV_ENROLLMENT'] === 'true'
-        })
-      : new LocalDemoAssessmentProvider()
-  assessment = new AssessmentManager(assessmentProvider, (state) => {
+  const publishAssessmentState = (state: AssessmentSession): void => {
+    const sessionKey = getLiveCameraSessionKey(state)
+    if (
+      cameraConsentSessionKey &&
+      (!sessionKey ||
+        sessionKey !== cameraConsentSessionKey ||
+        !['ready', 'authenticating', 'in_progress'].includes(state.status))
+    ) {
+      clearCameraAuthorization()
+    } else if (
+      sessionKey &&
+      sessionKey === cameraConsentSessionKey &&
+      cameraReadySessionKey === sessionKey &&
+      state.attemptId
+    ) {
+      cameraConsentAttemptId = state.attemptId
+    }
     if (chromeView && !chromeView.webContents.isDestroyed()) {
       chromeView.webContents.send('assessment-state', state)
     }
-  })
+  }
+  liveAssessment = new AssessmentManager(
+    new RemoteAssessmentProvider({
+      baseUrl: process.env['PEARL_ASSESSMENT_BACKEND_URL'] ?? '',
+      assessmentId: process.env['PEARL_ASSESSMENT_ID'] ?? ''
+    }),
+    publishAssessmentState
+  )
+  demoAssessment = new AssessmentManager(new LocalDemoAssessmentProvider(), publishAssessmentState)
+  assessment = demoAssessment
   mainWindow = new BaseWindow({ width: 1200, height: 800, autoHideMenuBar: true })
   chromeView = new WebContentsView({
     webPreferences: {
@@ -66,7 +113,13 @@ function createWindow(): void {
       })
     }
     const activeTab = tabs?.getState().tabs.find((tab) => tab.id === tabs?.getState().activeTabId)
-    if ((activeTab?.errorMessage || activeTab?.url === 'about:blank') && mainWindow && chromeView) {
+    if (assessmentSurfaceVisible && mainWindow && chromeView) {
+      mainWindow.contentView.addChildView(chromeView)
+    } else if (
+      (activeTab?.errorMessage || activeTab?.url === 'about:blank') &&
+      mainWindow &&
+      chromeView
+    ) {
       mainWindow.contentView.addChildView(chromeView)
     } else {
       tabs?.bringViewsToFront()
@@ -129,6 +182,9 @@ function createWindow(): void {
     tabs = undefined
     downloads = undefined
     assessment = undefined
+    clearCameraAuthorization()
+    liveAssessment = undefined
+    demoAssessment = undefined
     chromeView = undefined
     mainWindow = undefined
   })
@@ -191,12 +247,14 @@ function isActivityEvent(value: unknown): value is AssessmentActivityEvent {
     'search_performed',
     'ai_assistance_domain_visited',
     'tab_created',
+    'tab_creation_blocked',
     'tab_closed',
     'tab_switched',
     'popup_blocked',
     'navigation_blocked',
     'redirect_observed',
     'camera_started',
+    'camera_stopped',
     'camera_permission_denied',
     'camera_unavailable',
     'face_not_detected',
@@ -205,18 +263,54 @@ function isActivityEvent(value: unknown): value is AssessmentActivityEvent {
     'camera_disconnected'
   ]
   if (typeof event.type !== 'string' || !types.includes(event.type)) return false
-  return ['hostname', 'url', 'query'].every(
-    (key) =>
-      event[key] === undefined || (typeof event[key] === 'string' && event[key].length <= 512)
+  const allowedKeys = new Set([
+    'type',
+    'hostname',
+    'fromHostname',
+    'url',
+    'query',
+    'observationCount',
+    'observationDurationMs',
+    'confidence'
+  ])
+  if (Object.keys(event).some((key) => !allowedKeys.has(key))) return false
+  return (
+    ['hostname', 'fromHostname', 'url', 'query'].every(
+      (key) =>
+        event[key] === undefined || (typeof event[key] === 'string' && event[key].length <= 512)
+    ) &&
+    (event.observationCount === undefined ||
+      (Number.isInteger(event.observationCount) &&
+        Number(event.observationCount) >= 1 &&
+        Number(event.observationCount) <= 100)) &&
+    (event.observationDurationMs === undefined ||
+      (Number.isInteger(event.observationDurationMs) &&
+        Number(event.observationDurationMs) >= 0 &&
+        Number(event.observationDurationMs) <= 600_000)) &&
+    (event.confidence === undefined ||
+      (typeof event.confidence === 'number' &&
+        Number.isFinite(event.confidence) &&
+        event.confidence >= 0 &&
+        event.confidence <= 1))
   )
+}
+
+function isCameraActivityEvent(value: AssessmentActivityEvent): boolean {
+  return value.type.startsWith('camera_') || value.type.startsWith('face_')
 }
 
 ipcMain.handle('assessment:get-state', (event) => {
   if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment state request')
   return getAssessment().getState()
 })
-ipcMain.handle('assessment:start', async (event) => {
-  if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment request')
+ipcMain.handle('assessment:start', async (event, mode: unknown) => {
+  if (!isAssessmentSender(event) || (mode !== 'live' && mode !== 'demo')) {
+    throw new Error('Invalid assessment mode request')
+  }
+  assessmentSurfaceVisible = true
+  clearCameraAuthorization()
+  if (mainWindow && chromeView) mainWindow.contentView.addChildView(chromeView)
+  assessment = mode === 'live' ? liveAssessment : demoAssessment
   return getAssessment().start()
 })
 ipcMain.handle(
@@ -240,7 +334,33 @@ ipcMain.handle('assessment:request-otp', async (event, email: unknown) => {
 })
 ipcMain.handle('assessment:begin', async (event) => {
   if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment request')
-  return getAssessment().begin()
+  if (assessmentBeginInFlight) throw new Error('Assessment startup is already in progress.')
+  const manager = getAssessment()
+  const state = manager.getState()
+  const requiresCamera =
+    state.configuration?.provider === 'remote-backend' &&
+    state.configuration.policy.cameraMonitoring === true
+  if (requiresCamera) {
+    const sessionKey = getLiveCameraSessionKey(state)
+    if (
+      assessment !== liveAssessment ||
+      state.status !== 'ready' ||
+      !sessionKey ||
+      sessionKey !== cameraConsentSessionKey ||
+      sessionKey !== cameraPermissionSessionKey ||
+      sessionKey !== cameraReadySessionKey
+    ) {
+      throw new Error(
+        'Complete webcam consent and verify that the camera preview and face detector are ready before starting the exam.'
+      )
+    }
+  }
+  assessmentBeginInFlight = true
+  try {
+    return await manager.begin()
+  } finally {
+    assessmentBeginInFlight = false
+  }
 })
 ipcMain.handle('assessment:answer', (event, questionId: unknown, optionIndex: unknown) => {
   if (
@@ -271,7 +391,72 @@ ipcMain.handle('assessment:record-activity', async (event, value: unknown) => {
   if (!isAssessmentSender(event) || !isActivityEvent(value)) {
     throw new Error('Invalid assessment activity event')
   }
+  if (isCameraActivityEvent(value)) {
+    const state = liveAssessment?.getState()
+    if (
+      assessment !== liveAssessment ||
+      state?.status !== 'in_progress' ||
+      !state.attemptId ||
+      state.attemptId !== cameraConsentAttemptId
+    ) {
+      throw new Error('Camera activity is not authorized for this assessment attempt.')
+    }
+  }
   return getAssessment().recordActivityEvent(value)
+})
+
+ipcMain.handle('assessment:set-camera-consent', (event, consented: unknown) => {
+  if (!isAssessmentSender(event) || typeof consented !== 'boolean') {
+    throw new Error('Invalid camera consent request')
+  }
+  if (!consented) {
+    clearCameraAuthorization()
+    return
+  }
+  const state = liveAssessment?.getState()
+  const sessionKey = state && getLiveCameraSessionKey(state)
+  if (
+    assessment !== liveAssessment ||
+    !state ||
+    !['ready', 'in_progress'].includes(state.status) ||
+    !sessionKey
+  ) {
+    throw new Error('Camera setup is only available after live participant authentication.')
+  }
+  cameraConsentSessionKey = sessionKey
+  cameraPermissionSessionKey = undefined
+  cameraReadySessionKey = undefined
+  cameraConsentAttemptId = state.status === 'in_progress' ? state.attemptId : undefined
+})
+
+ipcMain.handle('assessment:set-camera-readiness', (event, ready: unknown) => {
+  if (!isAssessmentSender(event) || typeof ready !== 'boolean') {
+    throw new Error('Invalid camera readiness update')
+  }
+  if (!ready) {
+    cameraReadySessionKey = undefined
+    cameraPermissionSessionKey = undefined
+    return
+  }
+  const state = liveAssessment?.getState()
+  const sessionKey = state && getLiveCameraSessionKey(state)
+  if (
+    assessment !== liveAssessment ||
+    !state ||
+    !['ready', 'in_progress'].includes(state.status) ||
+    !sessionKey ||
+    sessionKey !== cameraConsentSessionKey ||
+    sessionKey !== cameraPermissionSessionKey ||
+    (state.status === 'in_progress' && state.attemptId !== cameraConsentAttemptId)
+  ) {
+    throw new Error('Camera and detector readiness could not be confirmed for this live session.')
+  }
+  cameraReadySessionKey = sessionKey
+})
+
+ipcMain.handle('assessment:get-proctoring-insights', (event) => {
+  if (!isAssessmentSender(event)) throw new Error('Unauthorized assessment request')
+  return getAssessment().getProctoringInsights()
 })
 
 ipcMain.handle('browser:command', (event, command: BrowserCommand) => {
@@ -350,6 +535,7 @@ ipcMain.handle('browser:command', (event, command: BrowserCommand) => {
           mainWindow.contentView.addChildView(chromeView)
         }
       } else {
+        assessmentSurfaceVisible = false
         tabs.bringViewsToFront()
       }
       break
@@ -370,6 +556,7 @@ ipcMain.handle('browser:command', (event, command: BrowserCommand) => {
 })
 
 app.whenReady().then(() => {
+  loadDotenv({ path: join(process.cwd(), '.env'), quiet: true })
   electronApp.setAppUserModelId('com.pearl.browser')
   persistence = new PersistenceService()
   if (
@@ -389,8 +576,97 @@ app.whenReady().then(() => {
       console.warn(`Certificate validation failed for an invalid URL: ${error}`)
     }
   })
-  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) =>
-    callback(false)
+  const isTrustedCameraDocument = (
+    webContents: Electron.WebContents | null,
+    requestingUrl: string | undefined,
+    isMainFrame: boolean | undefined
+  ): boolean => {
+    if (!webContents || webContents !== chromeView?.webContents || !isMainFrame) return false
+    if (!requestingUrl) return false
+    try {
+      const requested = new URL(requestingUrl)
+      const current = new URL(webContents.getURL())
+      return (
+        requested.protocol === current.protocol &&
+        requested.host === current.host &&
+        requested.pathname === current.pathname &&
+        requested.search === current.search
+      )
+    } catch {
+      return false
+    }
+  }
+  const mayUseAssessmentCamera = (
+    webContents: Electron.WebContents | null,
+    requestingUrl: string | undefined,
+    isMainFrame: boolean | undefined
+  ): boolean => {
+    if (!isTrustedCameraDocument(webContents, requestingUrl, isMainFrame)) return false
+    const state = liveAssessment?.getState()
+    const sessionKey = state && getLiveCameraSessionKey(state)
+    if (
+      assessment !== liveAssessment ||
+      !state ||
+      !sessionKey ||
+      sessionKey !== cameraConsentSessionKey
+    ) {
+      return false
+    }
+    if (state.status === 'ready') return true
+    return Boolean(
+      state.status === 'authenticating' ||
+      (state.status === 'in_progress' && state.attemptId === cameraConsentAttemptId)
+    )
+  }
+  session.defaultSession.setPermissionCheckHandler(
+    (webContents, permission, requestingOrigin, details) => {
+      if (permission !== 'media' || details.mediaType !== 'video') return false
+      if (
+        !mayUseAssessmentCamera(
+          webContents,
+          details.requestingUrl ?? requestingOrigin,
+          details.isMainFrame
+        )
+      ) {
+        return false
+      }
+      const state = liveAssessment?.getState()
+      const sessionKey = state && getLiveCameraSessionKey(state)
+      return Boolean(sessionKey && cameraPermissionSessionKey === sessionKey)
+    }
+  )
+  session.defaultSession.setPermissionRequestHandler(
+    async (webContents, permission, callback, details) => {
+      if (permission !== 'media') return callback(false)
+      const mediaRequest = details as Electron.MediaAccessPermissionRequest
+      if (
+        !mediaRequest.mediaTypes?.includes('video') ||
+        mediaRequest.mediaTypes.includes('audio') ||
+        !mayUseAssessmentCamera(webContents, mediaRequest.requestingUrl, mediaRequest.isMainFrame)
+      ) {
+        return callback(false)
+      }
+      const state = liveAssessment?.getState()
+      const sessionKey = state && getLiveCameraSessionKey(state)
+      if (process.platform === 'darwin') {
+        try {
+          if (systemPreferences.getMediaAccessStatus('camera') !== 'granted') {
+            const granted = await systemPreferences.askForMediaAccess('camera')
+            if (granted && sessionKey && sessionKey === cameraConsentSessionKey) {
+              cameraPermissionSessionKey = sessionKey
+            }
+            return callback(granted)
+          }
+        } catch (error) {
+          console.warn('macOS camera permission could not be requested:', error)
+          return callback(false)
+        }
+      }
+      if (sessionKey && sessionKey === cameraConsentSessionKey) {
+        cameraPermissionSessionKey = sessionKey
+      }
+      callback(true)
+    }
   )
   createWindow()
 })

@@ -8,6 +8,7 @@ import { EnrollmentTokenStore } from './enrollment'
 import { OtpAuthService } from './auth'
 import { SmtpOtpDelivery } from './mailer'
 import { AssessmentAuditStore } from './audit'
+import { OpenAIProctoringInsightProvider } from './proctoringInsights'
 
 loadDotenv({ path: join(process.cwd(), '.env'), quiet: true })
 
@@ -26,9 +27,17 @@ const service = new AssessmentService(
   enrollment,
   auditStore
 )
+const proctoringInsightProvider =
+  process.env.PEARL_PROCTORING_LLM_API_KEY && process.env.PEARL_PROCTORING_LLM_MODEL
+    ? new OpenAIProctoringInsightProvider(
+        process.env.PEARL_PROCTORING_LLM_API_KEY,
+        process.env.PEARL_PROCTORING_LLM_MODEL
+      )
+    : undefined
 const app = createApp(
   service,
-  new OtpAuthService(service, new SmtpOtpDelivery(config.smtp), config.otpSecret)
+  new OtpAuthService(service, new SmtpOtpDelivery(config.smtp), config.otpSecret),
+  proctoringInsightProvider
 )
 
 app

@@ -1,8 +1,11 @@
 import type {
   AssessmentActivityEvent,
+  AssessmentActivityReceipt,
   AssessmentConfiguration,
   AssessmentParticipant,
-  AssessmentSubmission
+  AssessmentQuestion,
+  AssessmentSubmission,
+  ProctoringInsightResult
 } from '../../shared/assessment'
 import type { AssessmentProvider } from './AssessmentProvider'
 
@@ -19,17 +22,19 @@ interface RemoteAssessmentResponse {
     title: string
     instructions: string
     durationMinutes: number
-    questions: Array<{
-      id: string
-      prompt: string
-      options: Array<{ id: string; text: string }>
-    }>
+    questionCount: number
   }
 }
 
 interface AttemptResponse {
   attemptId: string
   status: string
+  startedAt: string
+  deadline: string
+}
+
+interface QuestionsResponse {
+  questions: AssessmentQuestion[]
 }
 
 interface EnrollmentTokenResponse {
@@ -57,6 +62,7 @@ const remotePolicy: AssessmentConfiguration['policy'] = {
   durationMinutes: 10,
   recordHistory: false,
   warningOnRestrictedAction: true,
+  cameraMonitoring: true,
   expirationBehavior: 'submit',
   cancellationBehavior: 'return-to-browser'
 }
@@ -68,6 +74,7 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
   private readonly useDevelopmentEnrollment: boolean
   private enrollmentToken?: string
   private sessionCredential?: string
+  private authenticatedEmail?: string
   private configuration?: AssessmentConfiguration
 
   constructor(options: RemoteAssessmentProviderOptions) {
@@ -81,16 +88,22 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
     if (!this.baseUrl || !this.assessmentId) {
       throw new Error('Remote assessment provider requires a backend URL and assessment ID.')
     }
-    const response = await this.request<RemoteAssessmentResponse>(
-      `/api/assessments/${encodeURIComponent(this.assessmentId)}`
-    )
+    let response: RemoteAssessmentResponse
+    try {
+      response = await this.request<RemoteAssessmentResponse>(
+        `/api/assessments/${encodeURIComponent(this.assessmentId)}`
+      )
+    } catch (error) {
+      throw operationError('load published assessment metadata', error)
+    }
     const assessment = response.assessment
     const configuration: AssessmentConfiguration = {
       id: assessment.id,
       provider: 'remote-backend',
       title: assessment.title,
-      instructions: `${assessment.instructions} Remote backend mode.`,
-      questions: assessment.questions,
+      instructions: assessment.instructions,
+      questions: [],
+      questionCount: assessment.questionCount,
       policy: { ...remotePolicy, durationMinutes: assessment.durationMinutes }
     }
     this.configuration = configuration
@@ -102,6 +115,20 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
       this.enrollmentToken = enrollment.token
     }
     return configuration
+  }
+
+  async loadQuestions(configuration: AssessmentConfiguration): Promise<AssessmentQuestion[]> {
+    if (!this.sessionCredential)
+      throw new Error('Verify your email before loading assessment questions.')
+    let response: QuestionsResponse
+    try {
+      response = await this.request<QuestionsResponse>(
+        `/api/assessments/${encodeURIComponent(configuration.id)}/questions`
+      )
+    } catch (error) {
+      throw operationError('load assessment questions', error)
+    }
+    return response.questions
   }
 
   async authenticate(displayName: string): Promise<AssessmentParticipant> {
@@ -121,36 +148,77 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
   }
 
   async requestOtp(email: string): Promise<void> {
-    await this.request('/api/auth/otp/request', {
-      method: 'POST',
-      body: JSON.stringify({ email, assessmentId: this.assessmentId })
-    })
+    try {
+      await this.request('/api/auth/otp/request', {
+        method: 'POST',
+        body: JSON.stringify({ email, assessmentId: this.assessmentId })
+      })
+    } catch (error) {
+      throw operationError('send OTP email', error)
+    }
   }
 
   async authenticateOtp(email: string, code: string): Promise<AssessmentParticipant> {
-    const response = await this.request<{ sessionId: string; token: string }>(
-      '/api/auth/otp/verify',
-      {
+    const normalizedEmail = email.trim().toLowerCase()
+    if (this.sessionCredential && this.authenticatedEmail === normalizedEmail) {
+      return this.authenticate(normalizedEmail)
+    }
+    if (this.sessionCredential) await this.logout()
+    let response: { sessionId: string; token: string }
+    try {
+      response = await this.request<{ sessionId: string; token: string }>('/api/auth/otp/verify', {
         method: 'POST',
         body: JSON.stringify({ email, assessmentId: this.assessmentId, code })
-      }
-    )
+      })
+    } catch (error) {
+      throw operationError('verify OTP', error)
+    }
     this.sessionCredential = `${response.sessionId}.${response.token}`
-    return this.authenticate(email)
+    this.authenticatedEmail = normalizedEmail
+    return this.authenticate(normalizedEmail)
+  }
+
+  async logout(): Promise<void> {
+    const credential = this.sessionCredential
+    this.sessionCredential = undefined
+    this.authenticatedEmail = undefined
+    this.enrollmentToken = undefined
+    if (!credential) return
+    await this.request('/api/auth/logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${credential}` }
+    })
   }
 
   async startAttempt(
     configuration: AssessmentConfiguration,
     participant: AssessmentParticipant
-  ): Promise<{ attemptId: string }> {
-    const response = await this.request<AttemptResponse>(
-      `/api/assessments/${encodeURIComponent(configuration.id)}/attempts`,
-      {
-        method: 'POST',
-        body: JSON.stringify({ participantDisplayName: participant.displayName })
-      }
-    )
-    return { attemptId: response.attemptId }
+  ): Promise<{ attemptId: string; startedAt: string; deadline: string }> {
+    let response: AttemptResponse
+    try {
+      response = await this.request<AttemptResponse>(
+        `/api/assessments/${encodeURIComponent(configuration.id)}/attempts`,
+        {
+          method: 'POST',
+          body: JSON.stringify({ participantDisplayName: participant.displayName })
+        }
+      )
+    } catch (error) {
+      throw operationError('create authenticated assessment attempt', error)
+    }
+    if (
+      typeof response.attemptId !== 'string' ||
+      !response.attemptId ||
+      !Number.isFinite(Date.parse(response.startedAt)) ||
+      !Number.isFinite(Date.parse(response.deadline))
+    ) {
+      throw new Error('The backend returned an incomplete authenticated attempt.')
+    }
+    return {
+      attemptId: response.attemptId,
+      startedAt: response.startedAt,
+      deadline: response.deadline
+    }
   }
 
   async submitAnswers(
@@ -159,19 +227,24 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
     attemptId?: string
   ): Promise<AssessmentSubmission> {
     if (!attemptId) throw new Error('Remote assessment attempt is unavailable.')
-    const response = await this.request<SubmissionResponse>(
-      `/api/attempts/${encodeURIComponent(attemptId)}/submissions`,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          assessmentId: configuration.id,
-          answers: answers.map((answer) => ({
-            questionId: answer.questionId,
-            optionIndex: answer.optionIndex
-          }))
-        })
-      }
-    )
+    let response: SubmissionResponse
+    try {
+      response = await this.request<SubmissionResponse>(
+        `/api/attempts/${encodeURIComponent(attemptId)}/submissions`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            assessmentId: configuration.id,
+            answers: answers.map((answer) => ({
+              questionId: answer.questionId,
+              optionIndex: answer.optionIndex
+            }))
+          })
+        }
+      )
+    } catch (error) {
+      throw operationError('submit assessment answers', error)
+    }
     return {
       id: response.submissionId,
       submittedAt: response.submittedAt,
@@ -180,11 +253,36 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
     }
   }
 
-  async recordActivityEvent(event: AssessmentActivityEvent, attemptId: string): Promise<void> {
-    await this.request(`/api/attempts/${encodeURIComponent(attemptId)}/events`, {
+  async recordActivityEvent(
+    event: AssessmentActivityEvent,
+    attemptId: string
+  ): Promise<AssessmentActivityReceipt> {
+    const response = await this.request<{
+      accepted: boolean
+      event: AssessmentActivityReceipt
+    }>(`/api/attempts/${encodeURIComponent(attemptId)}/events`, {
       method: 'POST',
       body: JSON.stringify({ assessmentId: this.assessmentId, ...event })
     })
+    if (
+      response.accepted !== true ||
+      typeof response.event?.id !== 'string' ||
+      !response.event.id ||
+      !Number.isFinite(Date.parse(response.event.occurredAt))
+    ) {
+      throw new Error('The backend did not confirm the activity log entry.')
+    }
+    return response.event
+  }
+
+  async getProctoringInsights(
+    attemptId: string,
+    assessmentId: string
+  ): Promise<ProctoringInsightResult> {
+    if (!this.sessionCredential) throw new Error('Verify your email before requesting insights.')
+    return this.request<ProctoringInsightResult>(
+      `/api/attempts/${encodeURIComponent(attemptId)}/proctoring-insights?assessmentId=${encodeURIComponent(assessmentId)}`
+    )
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -216,4 +314,9 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
       clearTimeout(timer)
     }
   }
+}
+
+function operationError(operation: string, error: unknown): Error {
+  const detail = error instanceof Error ? error.message : 'The backend request failed.'
+  return new Error(`Failed to ${operation}: ${detail}`)
 }

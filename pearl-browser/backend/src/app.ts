@@ -4,8 +4,14 @@ import { NotFoundError, ValidationError } from './service'
 import { EnrollmentAuthorizationError, EnrollmentDisabledError } from './enrollment'
 import { AuthError, OtpAuthService } from './auth'
 import { auditEventTypes, type AuditEventInput } from './audit'
+import { AirtableRequestError } from './airtable'
+import type { ProctoringInsightProvider } from './proctoringInsights'
 
-export function createApp(service: AssessmentService, auth?: OtpAuthService): FastifyInstance {
+export function createApp(
+  service: AssessmentService,
+  auth?: OtpAuthService,
+  insightProvider?: ProctoringInsightProvider
+): FastifyInstance {
   const app = Fastify({ logger: false, bodyLimit: 64 * 1024 })
   app.get('/health', async () => ({ status: 'ok', service: 'pearl-assessment-backend' }))
   app.post<{ Body: { email?: string; assessmentId?: string } }>(
@@ -80,7 +86,17 @@ export function createApp(service: AssessmentService, auth?: OtpAuthService): Fa
   })
   app.post<{
     Params: { attemptId: string }
-    Body: { assessmentId?: string; type?: string; hostname?: string; url?: string; query?: string }
+    Body: {
+      assessmentId?: string
+      type?: string
+      hostname?: string
+      fromHostname?: string
+      url?: string
+      query?: string
+      observationCount?: number
+      observationDurationMs?: number
+      confidence?: number
+    }
   }>('/api/attempts/:attemptId/events', async (request, reply) => {
     try {
       if (
@@ -94,8 +110,53 @@ export function createApp(service: AssessmentService, auth?: OtpAuthService): Fa
       const credential = bearerToken(request.headers.authorization)
       auth.authorizeAttempt(credential, request.body.assessmentId, request.params.attemptId)
       const event = parseAuditEvent(request.body)
-      await service.recordActivityEvent(request.params.attemptId, request.body.assessmentId, event)
-      return reply.code(202).send({ accepted: true })
+      const recorded = await service.recordActivityEvent(
+        request.params.attemptId,
+        request.body.assessmentId,
+        event
+      )
+      return reply.code(202).send({ accepted: true, event: recorded })
+    } catch (error) {
+      return handleError(reply, error)
+    }
+  })
+  app.get<{
+    Params: { attemptId: string }
+    Querystring: { assessmentId?: string }
+  }>('/api/attempts/:attemptId/proctoring-insights', async (request, reply) => {
+    try {
+      const assessmentId = request.query.assessmentId
+      if (!auth || !isBoundedString(request.params.attemptId) || !isBoundedString(assessmentId)) {
+        return reply
+          .code(401)
+          .send({ status: 'failed', message: 'Authentication is invalid or expired.' })
+      }
+      const credential = bearerToken(request.headers.authorization)
+      auth.authorizeAttempt(credential, assessmentId, request.params.attemptId)
+      const events = await service.listActivityEvents(request.params.attemptId, assessmentId)
+      if (!insightProvider) {
+        return {
+          status: 'not_configured',
+          message:
+            'Configure PEARL_PROCTORING_LLM_API_KEY and PEARL_PROCTORING_LLM_MODEL in the backend environment to enable AI summaries.'
+        }
+      }
+      try {
+        const observations = await insightProvider.summarize(events)
+        return {
+          status: 'available',
+          message: 'Generated from structured backend-recorded event metadata.',
+          observations
+        }
+      } catch (error) {
+        return reply.code(503).send({
+          status: 'failed',
+          message:
+            error instanceof Error
+              ? error.message.slice(0, 180)
+              : 'AI summary is unavailable. Deterministic review rules remain active.'
+        })
+      }
     } catch (error) {
       return handleError(reply, error)
     }
@@ -124,11 +185,29 @@ export function createApp(service: AssessmentService, auth?: OtpAuthService): Fa
         if (!isBoundedString(request.params.assessmentId)) {
           return reply.code(400).send({ error: 'Assessment ID is invalid.' })
         }
-        return {
-          assessment: withoutRecordId(
-            await service.getPublishedAssessment(request.params.assessmentId)
-          )
+        const assessment = await service.getPublishedAssessment(request.params.assessmentId)
+        const { questions, ...metadata } = assessment
+        const { recordId, ...publicMetadata } = metadata
+        void recordId
+        return { assessment: { ...publicMetadata, questionCount: questions.length } }
+      } catch (error) {
+        return handleError(reply, error)
+      }
+    }
+  )
+  app.get<{ Params: { assessmentId: string } }>(
+    '/api/assessments/:assessmentId/questions',
+    async (request, reply) => {
+      try {
+        if (!auth || !isBoundedString(request.params.assessmentId)) {
+          return reply.code(401).send({ error: 'Authentication is invalid or expired.' })
         }
+        const identity = auth.authorize(
+          bearerToken(request.headers.authorization),
+          request.params.assessmentId
+        )
+        const assessment = await service.getPublishedAssessment(identity.assessmentId)
+        return { questions: assessment.questions }
       } catch (error) {
         return handleError(reply, error)
       }
@@ -224,6 +303,34 @@ function handleError(
     return reply.code(401).send({ error: 'Enrollment authorization is invalid or expired.' })
   if (error instanceof AuthError)
     return reply.code(401).send({ error: 'Authentication is invalid or expired.' })
+  if (error instanceof AirtableRequestError) {
+    const code = error.errorType ? ` ${error.errorType}` : ''
+    const detail = `Airtable rejected the request (HTTP ${error.status}${code}): ${error.safeMessage}`
+    if (error.status === 401 || error.status === 403) {
+      return reply.code(502).send({
+        error: `${detail} Check that AIRTABLE_PAT is valid, can access this base, and has data.records:read and data.records:write permissions.`
+      })
+    }
+    if (error.status === 404) {
+      return reply.code(502).send({
+        error: `${detail} Check AIRTABLE_BASE_ID and the configured Assessments, Questions, and Attempts table names.`
+      })
+    }
+    if (
+      /unknown field|field .*not found/i.test(error.safeMessage) &&
+      /ParticipantEmail/i.test(error.safeMessage)
+    ) {
+      return reply.code(502).send({
+        error: `${detail} Add a single-line text field named exactly ParticipantEmail to the configured Attempts table, then retry. See docs/AIRTABLE_SETUP.md.`
+      })
+    }
+    if (/unknown field|field .*not found/i.test(error.safeMessage)) {
+      return reply.code(502).send({
+        error: `${detail} Match the configured table fields to docs/AIRTABLE_SETUP.md.`
+      })
+    }
+    return reply.code(502).send({ error: detail })
+  }
   if (error instanceof AuthError)
     return reply.code(401).send({ error: 'Authentication is invalid or expired.' })
   if (error instanceof NotFoundError) return reply.code(404).send({ error: error.message })
@@ -254,17 +361,53 @@ function parseAuditEvent(value: Record<string, unknown>): AuditEventInput {
     throw new ValidationError('Audit event type is invalid.')
   }
   const event: AuditEventInput = { type: value.type as AuditEventInput['type'] }
-  for (const key of ['hostname', 'url', 'query'] as const) {
+  for (const key of ['hostname', 'fromHostname', 'url', 'query'] as const) {
     const field = value[key]
     if (field !== undefined && (typeof field !== 'string' || field.length > 512)) {
       throw new ValidationError('Audit event payload is invalid.')
     }
-    if (typeof field === 'string' && field.length > 0) event[key] = sanitizeAuditField(key, field)
+    if (typeof field === 'string' && field.length > 0) {
+      event[key] = sanitizeAuditField(key, field)
+    }
+  }
+  if (value.observationCount !== undefined) {
+    if (
+      !Number.isInteger(value.observationCount) ||
+      Number(value.observationCount) < 1 ||
+      Number(value.observationCount) > 100
+    ) {
+      throw new ValidationError('Audit observation count is invalid.')
+    }
+    event.observationCount = Number(value.observationCount)
+  }
+  if (value.observationDurationMs !== undefined) {
+    if (
+      !Number.isInteger(value.observationDurationMs) ||
+      Number(value.observationDurationMs) < 0 ||
+      Number(value.observationDurationMs) > 600_000
+    ) {
+      throw new ValidationError('Audit observation duration is invalid.')
+    }
+    event.observationDurationMs = Number(value.observationDurationMs)
+  }
+  if (value.confidence !== undefined) {
+    if (
+      typeof value.confidence !== 'number' ||
+      !Number.isFinite(value.confidence) ||
+      value.confidence < 0 ||
+      value.confidence > 1
+    ) {
+      throw new ValidationError('Audit confidence is invalid.')
+    }
+    event.confidence = value.confidence
   }
   return event
 }
 
-function sanitizeAuditField(key: 'hostname' | 'url' | 'query', value: string): string {
+function sanitizeAuditField(
+  key: 'hostname' | 'fromHostname' | 'url' | 'query',
+  value: string
+): string {
   if (key === 'query') {
     return value
       .replace(/[\r\n\t]+/g, ' ')
@@ -273,9 +416,13 @@ function sanitizeAuditField(key: 'hostname' | 'url' | 'query', value: string): s
   }
   try {
     const parsed = new URL(value)
-    return key === 'hostname' ? parsed.hostname.toLowerCase() : `${parsed.origin}${parsed.pathname}`
+    return key === 'hostname' || key === 'fromHostname'
+      ? parsed.hostname.toLowerCase()
+      : `${parsed.origin}${parsed.pathname}`
   } catch {
-    if (key === 'hostname' && /^[a-z0-9.-]+$/i.test(value)) return value.toLowerCase()
+    if ((key === 'hostname' || key === 'fromHostname') && /^[a-z0-9.-]+$/i.test(value)) {
+      return value.toLowerCase()
+    }
     throw new ValidationError('Audit event URL is invalid.')
   }
 }

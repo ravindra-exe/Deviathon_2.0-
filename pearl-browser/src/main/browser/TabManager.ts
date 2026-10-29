@@ -45,7 +45,10 @@ export class TabManager {
   ) {}
 
   createTab(input = NEW_TAB_URL): string {
-    if (!this.canCreateTab()) throw new Error('New tabs are disabled during the assessment.')
+    if (!this.canCreateTab()) {
+      this.onActivity({ type: 'tab_creation_blocked' })
+      throw new Error('New tabs are disabled during the assessment.')
+    }
     const id = `tab-${this.nextId++}`
     const view = new WebContentsView({
       webPreferences: {
@@ -77,7 +80,7 @@ export class TabManager {
       const url = this.navigation.normalize(input)
       tab.pendingNavigationUrl = url
       if (!this.canNavigate(url)) {
-        this.onActivity({ type: 'navigation_blocked', url })
+        this.emitUrlActivity('navigation_blocked', url)
         this.setNavigationError(
           tab,
           url,
@@ -86,7 +89,7 @@ export class TabManager {
         )
         return id
       }
-      this.onActivity({ type: 'navigation_started', url })
+      this.emitUrlActivity('navigation_started', url)
       void view.webContents.loadURL(url).catch((error: unknown) => {
         if (!this.isAlive(tab)) return
         if (tab.pendingNavigationUrl !== url) return
@@ -104,8 +107,9 @@ export class TabManager {
   activateTab(id: string): void {
     const tab = this.tabs.get(id)
     if (!tab) return
+    const changed = this.activeTabId !== id
     this.activeTabId = id
-    this.onActivity({ type: 'tab_switched' })
+    if (changed) this.onActivity({ type: 'tab_switched' })
     for (const [tabId, tab] of this.tabs) {
       tab.view.setVisible(tabId === id)
     }
@@ -113,7 +117,8 @@ export class TabManager {
     this.onChange()
   }
 
-  private beginHistoryNavigation(tab: ManagedTab): void {
+  private beginHistoryNavigation(tab: ManagedTab, targetUrl: string): void {
+    this.emitUrlActivity('navigation_started', targetUrl, tab.state.url)
     tab.navigationToken += 1
     tab.pendingNavigationUrl = undefined
     tab.state.navigationState = 'recovering'
@@ -146,18 +151,18 @@ export class TabManager {
     const tab = this.activeTab
     if (!tab) return
     const url = this.navigation.normalize(input)
+    if (this.navigation.isSearchQuery(input)) {
+      this.emitUrlActivity('search_performed', url)
+    }
     if (!this.canNavigate(url)) {
-      this.onActivity({ type: 'navigation_blocked', url })
+      this.emitUrlActivity('navigation_blocked', url, tab.state.url)
       tab.state.errorCode = -20
       tab.state.errorMessage = 'Navigation was blocked by the active assessment policy.'
       tab.state.failedUrl = url
       this.onChange()
       return
     }
-    this.onActivity({ type: 'navigation_started', url })
-    if (!this.navigation.isWebUrl(input)) {
-      this.onActivity({ type: 'search_performed', query: input.slice(0, 256) })
-    }
+    this.emitUrlActivity('navigation_started', url, tab.state.url)
     tab.navigationToken += 1
     tab.pendingNavigationUrl = url
     tab.state.navigationState = 'recovering'
@@ -182,7 +187,7 @@ export class TabManager {
     const history = tab?.view.webContents.navigationHistory
     const target = history ? history.getEntryAtIndex(history.getActiveIndex() - 1) : null
     if (tab && history?.canGoBack() && target && this.canNavigateHistory(target.url)) {
-      this.beginHistoryNavigation(tab)
+      this.beginHistoryNavigation(tab, target.url)
       history.goBack()
     }
   }
@@ -192,7 +197,7 @@ export class TabManager {
     const history = tab?.view.webContents.navigationHistory
     const target = history ? history.getEntryAtIndex(history.getActiveIndex() + 1) : null
     if (tab && history?.canGoForward() && target && this.canNavigateHistory(target.url)) {
-      this.beginHistoryNavigation(tab)
+      this.beginHistoryNavigation(tab, target.url)
       history.goForward()
     }
   }
@@ -307,7 +312,7 @@ export class TabManager {
       if (!isCurrent()) return
       const actualUrl = tab.view.webContents.getURL()
       if (tab.pendingNavigationUrl && tab.pendingNavigationUrl !== actualUrl) {
-        this.onActivity({ type: 'redirect_observed', url: actualUrl })
+        this.emitUrlActivity('redirect_observed', actualUrl)
       }
       tab.pendingVisitUrl = tab.view.webContents.getURL()
       tab.state.errorCode = undefined
@@ -325,14 +330,10 @@ export class TabManager {
       tab.state.failedUrl = undefined
       tab.pendingNavigationUrl = undefined
       this.syncState(tab)
-      this.onActivity({ type: 'navigation_completed', url: tab.state.url })
+      this.emitUrlActivity('navigation_completed', tab.state.url)
       const hostname = this.safeHostname(tab.state.url)
       if (hostname && isAssistanceDomain(hostname)) {
-        this.onActivity({
-          type: 'ai_assistance_domain_visited',
-          hostname,
-          url: tab.state.url
-        })
+        this.emitUrlActivity('ai_assistance_domain_visited', tab.state.url)
       }
     })
     webContents.on('did-navigate-in-page', () => {
@@ -371,7 +372,7 @@ export class TabManager {
     webContents.on('will-navigate', (event, url) => {
       if (!this.canNavigate(url)) {
         event.preventDefault()
-        this.onActivity({ type: 'navigation_blocked', url })
+        this.emitUrlActivity('navigation_blocked', url, tab.state.url)
         tab.state.errorCode = -20
         tab.state.errorMessage = 'Navigation was blocked by the active assessment policy.'
         tab.state.failedUrl = url
@@ -382,14 +383,19 @@ export class TabManager {
       if (!this.navigation.isWebUrl(url)) {
         event.preventDefault()
         this.navigation.openExternal(url)
+        return
+      }
+      if (tab.pendingNavigationUrl !== url) {
+        this.emitUrlActivity('navigation_started', url, tab.state.url)
+        tab.pendingNavigationUrl = url
       }
     })
     webContents.setWindowOpenHandler(({ url }) => {
       if (!this.canNavigateHistory(url, { popup: true })) {
-        this.onActivity({ type: 'popup_blocked', url })
+        this.emitUrlActivity('popup_blocked', url)
         return { action: 'deny' }
       }
-      this.onActivity({ type: 'popup_blocked', url })
+      this.emitUrlActivity('popup_blocked', url)
       return { action: 'deny' }
     })
   }
@@ -467,17 +473,40 @@ export class TabManager {
       return undefined
     }
   }
+
+  private emitUrlActivity(
+    type: AssessmentActivityEvent['type'],
+    value: string,
+    fromValue?: string
+  ): void {
+    const location = safeActivityLocation(value)
+    const fromHostname = fromValue ? this.safeHostname(fromValue) : undefined
+    this.onActivity({
+      type,
+      ...(location ?? {}),
+      ...(fromHostname ? { fromHostname } : {})
+    })
+  }
 }
 
 function isAssistanceDomain(hostname: string): boolean {
-  return (
-    hostname === 'chatgpt.com' ||
-    hostname.endsWith('.chatgpt.com') ||
-    hostname === 'chat.openai.com' ||
-    hostname.endsWith('.openai.com') ||
-    hostname === 'claude.ai' ||
-    hostname.endsWith('.claude.ai') ||
-    hostname === 'anthropic.com' ||
-    hostname.endsWith('.anthropic.com')
-  )
+  const roots = [
+    'chatgpt.com',
+    'chat.openai.com',
+    'claude.ai',
+    'gemini.google.com',
+    'copilot.microsoft.com',
+    'perplexity.ai'
+  ]
+  return roots.some((root) => hostname === root || hostname.endsWith(`.${root}`))
+}
+
+function safeActivityLocation(value: string): { hostname: string; url: string } | undefined {
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
+    return { hostname: url.hostname.toLowerCase(), url: url.origin }
+  } catch {
+    return undefined
+  }
 }

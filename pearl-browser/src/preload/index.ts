@@ -4,7 +4,7 @@ import type { AssessmentAPI, AssessmentActivityEvent } from '../shared/assessmen
 
 const assessment: AssessmentAPI = {
   getState: () => ipcRenderer.invoke('assessment:get-state'),
-  start: () => ipcRenderer.invoke('assessment:start'),
+  start: (mode) => ipcRenderer.invoke('assessment:start', mode),
   authenticate: (displayName, demoCode) =>
     ipcRenderer.invoke('assessment:authenticate', displayName, demoCode),
   requestOtp: (email) => ipcRenderer.invoke('assessment:request-otp', email),
@@ -16,6 +16,11 @@ const assessment: AssessmentAPI = {
   cancel: () => ipcRenderer.invoke('assessment:cancel'),
   recordActivityEvent: (event: AssessmentActivityEvent) =>
     ipcRenderer.invoke('assessment:record-activity', event),
+  setCameraConsent: (consented: boolean) =>
+    ipcRenderer.invoke('assessment:set-camera-consent', consented),
+  setCameraReadiness: (ready: boolean) =>
+    ipcRenderer.invoke('assessment:set-camera-readiness', ready),
+  getProctoringInsights: () => ipcRenderer.invoke('assessment:get-proctoring-insights'),
   onStateChange: (listener) => {
     const handler = (
       _event: Electron.IpcRendererEvent,

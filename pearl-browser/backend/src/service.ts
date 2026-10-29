@@ -1,6 +1,6 @@
 import type { AirtableClient, AirtableRecord } from './airtable'
 import { EnrollmentAuthorizationError, EnrollmentTokenStore } from './enrollment'
-import type { AssessmentAuditStore, AuditEventInput } from './audit'
+import type { AssessmentAuditEvent, AssessmentAuditStore, AuditEventInput } from './audit'
 
 export interface AssessmentData {
   id: string
@@ -21,6 +21,8 @@ export interface AttemptData {
   assessmentId: string
   recordId: string
   status: 'in_progress' | 'submitted'
+  startedAt: string
+  deadline: string
 }
 
 export class AssessmentService {
@@ -96,16 +98,25 @@ export class AssessmentService {
     const attemptId = crypto.randomUUID()
     if (!enrollmentToken && !participantEmail) throw new EnrollmentAuthorizationError()
     if (enrollmentToken) this.enrollment.bindAttempt(enrollmentToken, assessment.id, attemptId)
+    const startedAt = new Date()
+    const deadline = new Date(startedAt.getTime() + assessment.durationMinutes * 60_000)
     const record = await this.airtable.create(this.tables.attempts, {
       AttemptId: attemptId,
       AssessmentId: assessment.id,
       ParticipantDisplayName: participantDisplayName.trim(),
       ...(participantEmail ? { ParticipantEmail: participantEmail } : {}),
-      StartedAt: new Date().toISOString(),
+      StartedAt: startedAt.toISOString(),
       Status: 'in_progress',
       AnswersJSON: '[]'
     })
-    return { attemptId, assessmentId: assessment.id, recordId: record.id, status: 'in_progress' }
+    return {
+      attemptId,
+      assessmentId: assessment.id,
+      recordId: record.id,
+      status: 'in_progress',
+      startedAt: startedAt.toISOString(),
+      deadline: deadline.toISOString()
+    }
   }
 
   async submit(
@@ -221,7 +232,7 @@ export class AssessmentService {
     attemptId: string,
     assessmentId: string,
     event: AuditEventInput
-  ): Promise<void> {
+  ): Promise<AssessmentAuditEvent> {
     if (!this.auditStore) throw new Error('Audit event storage is unavailable.')
     if (!isBoundedIdentifier(attemptId)) throw new ValidationError('Attempt ID is invalid.')
     if (!isBoundedIdentifier(assessmentId)) throw new ValidationError('Assessment ID is invalid.')
@@ -233,18 +244,44 @@ export class AssessmentService {
     if (!attempt || stringField(attempt, 'AssessmentId') !== assessmentId) {
       throw new NotFoundError('Attempt not found.')
     }
-    if (stringField(attempt, 'Status') !== 'in_progress') {
-      throw new ValidationError('Assessment activity is no longer active.')
+    const status = stringField(attempt, 'Status')
+    if (event.type === 'assessment_submitted') {
+      if (status !== 'submitted' || !optionalStringField(attempt, 'SubmittedAt')) {
+        throw new ValidationError('Assessment submission activity is not confirmed.')
+      }
+    } else {
+      if (status !== 'in_progress') {
+        throw new ValidationError('Assessment activity is no longer active.')
+      }
+      const assessment = await this.getPublishedAssessment(assessmentId)
+      const startedAt = Date.parse(stringField(attempt, 'StartedAt'))
+      if (
+        !Number.isFinite(startedAt) ||
+        Date.now() >= startedAt + assessment.durationMinutes * 60_000
+      ) {
+        throw new ValidationError('Assessment activity is no longer active.')
+      }
     }
-    const assessment = await this.getPublishedAssessment(assessmentId)
-    const startedAt = Date.parse(stringField(attempt, 'StartedAt'))
-    if (
-      !Number.isFinite(startedAt) ||
-      Date.now() >= startedAt + assessment.durationMinutes * 60_000
-    ) {
-      throw new ValidationError('Assessment activity is no longer active.')
+    return this.auditStore.append(assessmentId, attemptId, event)
+  }
+
+  async listActivityEvents(
+    attemptId: string,
+    assessmentId: string
+  ): Promise<AssessmentAuditEvent[]> {
+    if (!this.auditStore) throw new ValidationError('Activity logging is unavailable.')
+    if (!isBoundedIdentifier(attemptId) || !isBoundedIdentifier(assessmentId)) {
+      throw new ValidationError('Attempt or assessment ID is invalid.')
     }
-    this.auditStore.append(assessmentId, attemptId, event)
+    const records = await this.airtable.list(
+      this.tables.attempts,
+      `{AttemptId} = '${escapeFormula(attemptId)}'`
+    )
+    const attempt = records[0]
+    if (!attempt || stringField(attempt, 'AssessmentId') !== assessmentId) {
+      throw new NotFoundError('Attempt not found.')
+    }
+    return this.auditStore.list(attemptId)
   }
 
   private authorizeAttempt(

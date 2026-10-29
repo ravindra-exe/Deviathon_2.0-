@@ -82,6 +82,55 @@ function assessmentService(auditStore = new AssessmentAuditStore()): AssessmentS
 }
 
 describe('assessment API', () => {
+  it('returns metadata without questions and requires OTP for question retrieval', async () => {
+    const delivery = new TestDelivery()
+    const service = assessmentService()
+    const auth = new OtpAuthService(service, delivery, 'test-secret', () => 1_000)
+    const app = createApp(service, auth)
+    const metadata = await app.inject({ method: 'GET', url: '/api/assessments/a1' })
+    expect(metadata.statusCode).toBe(200)
+    expect(metadata.json().assessment).toMatchObject({
+      id: 'a1',
+      title: 'A',
+      durationMinutes: 5,
+      questionCount: 1
+    })
+    expect(metadata.json().assessment).not.toHaveProperty('questions')
+
+    const unauthorized = await app.inject({
+      method: 'GET',
+      url: '/api/assessments/a1/questions'
+    })
+    expect(unauthorized.statusCode).toBe(401)
+
+    await app.inject({
+      method: 'POST',
+      url: '/api/auth/otp/request',
+      payload: { email: 'participant@example.com', assessmentId: 'a1' }
+    })
+    const verification = await app.inject({
+      method: 'POST',
+      url: '/api/auth/otp/verify',
+      payload: {
+        email: 'participant@example.com',
+        assessmentId: 'a1',
+        code: delivery.messages[0].code
+      }
+    })
+    const authenticatedSession = verification.json()
+    const questions = await app.inject({
+      method: 'GET',
+      url: '/api/assessments/a1/questions',
+      headers: {
+        authorization: `Bearer ${authenticatedSession.sessionId}.${authenticatedSession.token}`
+      }
+    })
+    expect(questions.statusCode).toBe(200)
+    expect(questions.json().questions).toHaveLength(1)
+    expect(questions.body).not.toContain('CorrectOptionId')
+    await app.close()
+  })
+
   it('invokes OTP delivery without returning the code', async () => {
     const delivery = new TestDelivery()
     const app = createApp(

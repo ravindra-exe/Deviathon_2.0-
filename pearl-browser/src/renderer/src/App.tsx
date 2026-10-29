@@ -136,6 +136,16 @@ function App(): React.JSX.Element {
   }, [])
 
   useEffect(() => {
+    let mounted = true
+    void window.browser.assessment.getState().then((assessmentSession) => {
+      if (mounted && assessmentSession.status !== 'idle') setAssessmentMode(true)
+    })
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  useEffect(() => {
     return window.browser.onFocusAddress(() => {
       const input = document.querySelector<HTMLInputElement>('input[name="address"]')
       input?.focus()
@@ -181,6 +191,8 @@ function App(): React.JSX.Element {
 
   return assessmentMode ? (
     <AssessmentExperience
+      browserState={state}
+      onBrowserCommand={command}
       onExit={() => {
         void window.browser.assessment.cancel().finally(() => {
           setAssessmentMode(false)

@@ -9,6 +9,7 @@ interface NavigationToolbarProps {
   onBookmark: () => void
   onPanel: (panel: 'bookmarks' | 'history' | 'downloads' | 'settings') => void
   onAssessment: () => void
+  assessmentSurface?: boolean
 }
 
 export function NavigationToolbar({
@@ -18,7 +19,8 @@ export function NavigationToolbar({
   onNavigate,
   onBookmark,
   onPanel,
-  onAssessment
+  onAssessment,
+  assessmentSurface = false
 }: NavigationToolbarProps): React.JSX.Element {
   const [address, setAddress] = useState(
     activeTab?.url === 'about:blank' ? '' : (activeTab?.url ?? '')
@@ -73,6 +75,8 @@ export function NavigationToolbar({
         </button>
       </form>
       {activeTab?.isLoading && <div className="loading-progress" aria-label="Page loading" />}
+      {!assessmentSurface && (
+        <>
       <button
         className={`toolbar-button ${isBookmarked ? 'bookmarked' : ''}`}
         onClick={onBookmark}
@@ -108,10 +112,12 @@ export function NavigationToolbar({
       <button
         className="toolbar-button assessment-launch"
         onClick={onAssessment}
-        title="Open demonstration examination"
+        title="Choose live assessment or demo mode"
       >
-        Demo exam
+        Assessment
       </button>
+        </>
+      )}
     </div>
   )
 }

@@ -77,6 +77,71 @@ describe('AssessmentManager', () => {
     expect(submitted.submission?.status).toBe('accepted')
   })
 
+  it('loads remote questions only after authentication when the participant starts', async () => {
+    const local = new LocalDemoAssessmentProvider()
+    const fullConfiguration = await local.getConfiguration()
+    let questionLoads = 0
+    const provider: AssessmentProvider = {
+      getConfiguration: async () => ({
+        ...fullConfiguration,
+        provider: 'remote-backend',
+        questions: [],
+        questionCount: fullConfiguration.questions.length
+      }),
+      authenticate: (displayName, demoCode) => local.authenticate(displayName, demoCode),
+      authenticateOtp: async () => ({
+        id: 'verified-participant',
+        displayName: 'participant@example.com',
+        provider: 'remote-backend',
+        demoOnly: false
+      }),
+      loadQuestions: async () => {
+        questionLoads += 1
+        return fullConfiguration.questions
+      },
+      startAttempt: async () => ({ attemptId: 'attempt-1' }),
+      submitAnswers: (configuration, answers) => local.submitAnswers(configuration, answers)
+    }
+    const manager = new Manager(provider, () => undefined)
+
+    await manager.start()
+    expect(manager.getState().configuration?.questions).toEqual([])
+    expect(questionLoads).toBe(0)
+    await manager.authenticate('participant@example.com', '123456')
+    expect(questionLoads).toBe(0)
+    await manager.begin()
+
+    expect(questionLoads).toBe(1)
+    expect(manager.getState().configuration?.questions).toHaveLength(3)
+    expect(manager.getState().status).toBe('in_progress')
+  })
+
+  it('keeps OTP request and verification errors on the ready sign-in state', async () => {
+    const local = new LocalDemoAssessmentProvider()
+    const provider: AssessmentProvider = {
+      getConfiguration: () => local.getConfiguration(),
+      authenticate: (displayName, demoCode) => local.authenticate(displayName, demoCode),
+      requestOtp: async () => {
+        throw new Error('OTP delivery unavailable.')
+      },
+      authenticateOtp: async () => {
+        throw new Error('Authentication failed.')
+      },
+      submitAnswers: (configuration, answers) => local.submitAnswers(configuration, answers)
+    }
+    const manager = new Manager(provider, () => undefined)
+    await manager.start()
+
+    await expect(manager.requestOtp('participant@example.com')).rejects.toThrow(
+      'OTP delivery unavailable.'
+    )
+    await expect(manager.authenticate('participant@example.com', '000000')).rejects.toThrow(
+      'Authentication failed.'
+    )
+    expect(manager.getState().status).toBe('ready')
+    expect(manager.getState().participant).toBeUndefined()
+  })
+
   it('rejects invalid answers and uses explicit host matching for policy checks', async () => {
     const manager = new Manager(new LocalDemoAssessmentProvider(), () => undefined)
     await manager.start()

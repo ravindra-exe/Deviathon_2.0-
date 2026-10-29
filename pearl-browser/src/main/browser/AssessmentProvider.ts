@@ -1,8 +1,11 @@
 import type {
   AssessmentActivityEvent,
+  AssessmentActivityReceipt,
   AssessmentConfiguration,
   AssessmentParticipant,
-  AssessmentSubmission
+  AssessmentQuestion,
+  AssessmentSubmission,
+  ProctoringInsightResult
 } from '../../shared/assessment'
 
 export interface AssessmentIdentityProvider {
@@ -12,17 +15,23 @@ export interface AssessmentIdentityProvider {
 
 export interface AssessmentProvider extends AssessmentIdentityProvider {
   getConfiguration(): Promise<AssessmentConfiguration>
+  loadQuestions?(configuration: AssessmentConfiguration): Promise<AssessmentQuestion[]>
+  logout?(): Promise<void>
   startAttempt?(
     configuration: AssessmentConfiguration,
     participant: AssessmentParticipant
-  ): Promise<{ attemptId: string }>
+  ): Promise<{ attemptId: string; startedAt?: string; deadline?: string }>
   submitAnswers(
     configuration: AssessmentConfiguration,
     answers: ReadonlyArray<{ questionId: string; optionIndex: number }>,
     attemptId?: string
   ): Promise<AssessmentSubmission>
   requestOtp?(email: string, assessmentId: string): Promise<void>
-  recordActivityEvent?(event: AssessmentActivityEvent, attemptId: string): Promise<void>
+  recordActivityEvent?(
+    event: AssessmentActivityEvent,
+    attemptId: string
+  ): Promise<AssessmentActivityReceipt>
+  getProctoringInsights?(attemptId: string, assessmentId: string): Promise<ProctoringInsightResult>
 }
 
 export class LocalDemoAssessmentProvider implements AssessmentProvider {
@@ -46,6 +55,7 @@ export class LocalDemoAssessmentProvider implements AssessmentProvider {
         durationMinutes: 10,
         recordHistory: false,
         warningOnRestrictedAction: true,
+        cameraMonitoring: false,
         expirationBehavior: 'submit',
         cancellationBehavior: 'return-to-browser'
       },

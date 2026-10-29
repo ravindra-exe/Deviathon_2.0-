@@ -108,6 +108,11 @@ export class NavigationService {
     }
   }
 
+  isSearchQuery(value: string): boolean {
+    const input = value.trim()
+    return Boolean(input) && !this.isExplicitWebUrl(input) && !this.isLikelyHostname(input)
+  }
+
   openExternal(value: string): void {
     try {
       const url = new URL(value)

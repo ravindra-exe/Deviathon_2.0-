@@ -67,6 +67,14 @@ current audit store is append-only in memory and is lost when the backend
 restarts; it does not store camera frames, page contents, credentials, or raw
 form input. A durable audit table is a future storage milestone.
 
+The optional `GET /api/attempts/:attemptId/proctoring-insights` endpoint uses
+the same authenticated session-to-attempt binding. Without an LLM configuration,
+the UI still computes its transparent deterministic review level from recorded
+events. To enable structured AI notes, add `PEARL_PROCTORING_LLM_API_KEY` and
+`PEARL_PROCTORING_LLM_MODEL` to the backend `.env` and restart the backend. The
+server sends only sanitized event metadata to the configured OpenAI Responses
+API; it does not send participant credentials or webcam frames.
+
 For local integration testing only, set `DEV_ENROLLMENT_ENABLED=true` while
 `NODE_ENV` is not `production`. The `POST /api/dev/enrollment-tokens` endpoint
 then issues a backend-generated, short-lived, single-attempt bearer token.
@@ -76,9 +84,16 @@ React state or renderer code. The endpoint returns `404` when disabled.
 ## API
 
 - `GET /health`
+- `POST /api/auth/otp/request`
+- `POST /api/auth/otp/verify`
+- `GET /api/auth/session`
+- `POST /api/auth/logout`
 - `GET /api/assessments/:assessmentId`
+- `GET /api/assessments/:assessmentId/questions` (verified email session required)
 - `POST /api/assessments/:assessmentId/attempts`
 - `POST /api/attempts/:attemptId/submissions`
+- `POST /api/attempts/:attemptId/events` (authenticated live attempt required)
+- `GET /api/attempts/:attemptId/proctoring-insights` (authenticated attempt required)
 - `GET /api/attempts/:attemptId/submission`
 - `POST /api/dev/enrollment-tokens` (development only)
 
@@ -86,19 +101,22 @@ Attempt creation, submission, and status requests require the development
 enrollment bearer token when enabled. The backend validates published
 assessments, active questions, answer option indexes, attempt ownership,
 server-side deadlines, and completed-attempt idempotency. Correct-answer fields
-are never returned by the assessment endpoint.
+are never returned by either assessment endpoint. OTP-authenticated attempts
+write the verified address to `Attempts.ParticipantEmail`; create that
+single-line text field if it is not present. Airtable errors from attempt
+creation include the upstream status and a schema or permission hint so the
+operator can correct the PAT or table setup.
 
-To select remote mode in Electron, set these non-secret values before starting
-Electron:
+To connect the Electron Live Assessment flow to this backend, set these
+non-secret values before starting Electron:
 
 ```text
-PEARL_ASSESSMENT_PROVIDER=remote
 PEARL_ASSESSMENT_BACKEND_URL=http://127.0.0.1:8787
-PEARL_ASSESSMENT_ID=your-assessment-id
-PEARL_ASSESSMENT_DEV_ENROLLMENT=true
+PEARL_ASSESSMENT_ID=pearl-demo-001
 ```
 
-If remote mode is selected and the backend is unavailable, the assessment
-shows a failure state. It does not silently switch to local demo data.
-The development enrollment token is not participant identity verification.
-Production participant authentication remains a release-blocking requirement.
+The Live Assessment option always uses email OTP. Demo Mode remains a separate
+local-only path. If the backend is unavailable, Live Assessment shows a failure
+state and does not switch to demo data. OTP verifies access to an email inbox;
+the current schema has no participant roster and therefore does not prove exam
+enrollment or legal identity.
