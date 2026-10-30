@@ -72,8 +72,14 @@ the same authenticated session-to-attempt binding. Without an LLM configuration,
 the UI still computes its transparent deterministic review level from recorded
 events. To enable structured AI notes, add `PEARL_PROCTORING_LLM_API_KEY` and
 `PEARL_PROCTORING_LLM_MODEL` to the backend `.env` and restart the backend. The
-server sends only sanitized event metadata to the configured OpenAI Responses
-API; it does not send participant credentials or webcam frames.
+server selects Google's Gemini API when the model name begins with `gemini-`;
+otherwise it uses the configured OpenAI Responses API. Proctoring summaries
+send only event IDs, event types, timestamps, and numeric detection metadata.
+They exclude participant identity, session/authentication credentials, host and
+URL details, search text, and webcam media. Gemini's structured response is
+validated against the supplied event IDs, and observed facts shown in the
+console are reconstructed from backend records. Deterministic review levels
+remain independent of AI-generated interpretations.
 
 For local integration testing only, set `DEV_ENROLLMENT_ENABLED=true` while
 `NODE_ENV` is not `production`. The `POST /api/dev/enrollment-tokens` endpoint

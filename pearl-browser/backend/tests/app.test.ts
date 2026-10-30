@@ -1,13 +1,27 @@
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { AirtableClient, AirtableRecord } from '../src/airtable'
 import { createApp } from '../src/app'
+import { AirtableRequestError } from '../src/airtable'
 import { AssessmentService } from '../src/service'
 import { EnrollmentTokenStore } from '../src/enrollment'
 import { OtpAuthService } from '../src/auth'
 import type { OtpDelivery, OtpMessage } from '../src/mailer'
-import { AssessmentAuditStore } from '../src/audit'
+import { AdminActionAuditStore, AssessmentAuditStore } from '../src/audit'
+import type { AssessmentAuditEvent } from '../src/audit'
+import type { ProctoringInsightResult } from '../../src/shared/assessment'
+import type { ProctoringInsightProvider } from '../src/proctoringInsights'
+import type { QuestionGenerationProvider } from '../src/questionGeneration'
 
 const attempts: AirtableRecord[] = []
+function authorizationHeader(session: { sessionId: string; token: string }): {
+  authorization: string
+} {
+  return { authorization: ['Bearer', `${session.sessionId}.${session.token}`].join(' ') }
+}
+
 const client: AirtableClient = {
   async list(table: string, filterByFormula?: string): Promise<AirtableRecord[]> {
     if (table === 'Assessments') {
@@ -82,6 +96,290 @@ function assessmentService(auditStore = new AssessmentAuditStore()): AssessmentS
 }
 
 describe('assessment API', () => {
+  it('serves dashboard overview data when a question record has malformed options', async () => {
+    const invalidQuestionClient: AirtableClient = {
+      async list(table, filterByFormula) {
+        const records = await client.list(table, filterByFormula)
+        if (table !== 'Questions') return records
+        return records.map((record) => ({
+          ...record,
+          fields: { ...record.fields, OptionsJSON: '{invalid' }
+        }))
+      },
+      create: (table, fields) => client.create(table, fields),
+      update: (table, recordId, fields) => client.update(table, recordId, fields)
+    }
+    const service = new AssessmentService(
+      invalidQuestionClient,
+      { assessments: 'Assessments', questions: 'Questions', attempts: 'Attempts' },
+      new EnrollmentTokenStore(true)
+    )
+    const delivery = new TestDelivery()
+    const auth = new OtpAuthService(assessmentService(), delivery, 'test-secret', () => 1_000, [
+      'admin@example.com'
+    ])
+    const app = createApp(service, auth)
+
+    await auth.requestAdminOtp('admin@example.com', 'ip')
+    const session = auth.verifyAdminOtp('admin@example.com', delivery.messages[0].code)
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/admin/console',
+      headers: authorizationHeader(session)
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json().metrics.totalAssessments).toBe(1)
+    expect(response.json().questions[0]).toMatchObject({
+      id: 'q1',
+      assessmentId: '',
+      validationError: 'Question OptionsJSON is malformed JSON.'
+    })
+    expect(response.json().questionValidationErrors).toHaveLength(1)
+    expect(response.body).not.toContain('CorrectOptionId')
+    await app.close()
+  })
+
+  it('returns the structured AI insight only after administrator authentication', async () => {
+    const auditStore = new AssessmentAuditStore()
+    const insightClient: AirtableClient = {
+      ...client,
+      async list(table, filterByFormula) {
+        if (table === 'Attempts') {
+          return [
+            {
+              id: 'attempt-record',
+              fields: { AttemptId: 'attempt-1', AssessmentId: 'a1', Status: 'submitted' }
+            }
+          ]
+        }
+        return client.list(table, filterByFormula)
+      }
+    }
+    const service = new AssessmentService(
+      insightClient,
+      { assessments: 'Assessments', questions: 'Questions', attempts: 'Attempts' },
+      new EnrollmentTokenStore(true),
+      auditStore
+    )
+    const recorded = auditStore.append('a1', 'attempt-1', {
+      type: 'face_not_detected',
+      observationDurationMs: 5_200
+    })
+    let receivedEvents: readonly AssessmentAuditEvent[] = []
+    const result: ProctoringInsightResult = {
+      status: 'available',
+      message: 'Structured recorded evidence summary.',
+      provider: 'Google Gemini',
+      model: 'gemini-test-model',
+      summary: 'A sustained face absence signal was recorded.',
+      observedFacts: [
+        {
+          eventId: recorded.id,
+          type: recorded.type,
+          occurredAt: recorded.occurredAt,
+          observationDurationMs: recorded.observationDurationMs
+        }
+      ],
+      supportingEventIds: [recorded.id],
+      riskIndicators: [],
+      confidenceLimitations: ['Metadata alone does not establish intent.'],
+      reviewerRecommendations: ['Review the underlying event in context.']
+    }
+    const provider: ProctoringInsightProvider = {
+      provider: 'Google Gemini',
+      model: 'gemini-test-model',
+      async summarize(events) {
+        receivedEvents = events
+        return result
+      }
+    }
+    const delivery = new TestDelivery()
+    const auth = new OtpAuthService(service, delivery, 'test-secret', () => 1_000, [
+      'admin@example.com'
+    ])
+    const app = createApp(service, auth, provider)
+    const unauthenticated = await app.inject({
+      method: 'GET',
+      url: '/api/admin/attempts/attempt-1/insights?assessmentId=a1'
+    })
+    expect(unauthenticated.statusCode).toBe(401)
+
+    await auth.requestAdminOtp('admin@example.com', 'ip')
+    const session = auth.verifyAdminOtp('admin@example.com', delivery.messages[0].code)
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/admin/attempts/attempt-1/insights?assessmentId=a1',
+      headers: authorizationHeader(session)
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(response.json()).toMatchObject({
+      status: 'available',
+      provider: 'Google Gemini',
+      model: 'gemini-test-model',
+      summary: result.summary,
+      observedFacts: result.observedFacts,
+      confidenceLimitations: result.confidenceLimitations
+    })
+    expect(receivedEvents.map((event) => event.id)).toEqual([recorded.id])
+    await app.close()
+  })
+
+  it('protects administrator data with an allowlisted verified OTP session', async () => {
+    const delivery = new TestDelivery()
+    const auth = new OtpAuthService(assessmentService(), delivery, 'test-secret', () => 1_000, [
+      'admin@example.com'
+    ])
+    const app = createApp(assessmentService(), auth)
+    const unauthenticated = await app.inject({ method: 'GET', url: '/api/admin/console' })
+    expect(unauthenticated.statusCode).toBe(401)
+    expect((await app.inject({ method: 'GET', url: '/api/admin/auth/session' })).statusCode).toBe(
+      401
+    )
+
+    await auth.requestOtp('participant@example.com', 'a1', 'ip')
+    const participant = auth.verifyOtp('participant@example.com', 'a1', delivery.messages[0].code)
+    const forbidden = await app.inject({
+      method: 'GET',
+      url: '/api/admin/console',
+      headers: { authorization: `Bearer ${participant.sessionId}.${participant.token}` }
+    })
+    expect(forbidden.statusCode).toBe(401)
+    const forbiddenAudit = await app.inject({
+      method: 'POST',
+      url: '/api/admin/audit',
+      headers: { authorization: `Bearer ${participant.sessionId}.${participant.token}` },
+      payload: { action: 'report_export', targetId: 'attempts' }
+    })
+    expect(forbiddenAudit.statusCode).toBe(401)
+
+    const unauthorizedOtpRequest = await app.inject({
+      method: 'POST',
+      url: '/api/admin/auth/otp/request',
+      payload: { email: 'not-allowed@example.com' }
+    })
+    expect(unauthorizedOtpRequest.statusCode).toBe(403)
+    expect(unauthorizedOtpRequest.json().error).toContain('not authorized')
+
+    const otpRequest = await app.inject({
+      method: 'POST',
+      url: '/api/admin/auth/otp/request',
+      payload: { email: 'admin@example.com' }
+    })
+    expect(otpRequest.statusCode).toBe(202)
+    expect(otpRequest.body).not.toContain(delivery.messages[1].code)
+    const wrongCode = delivery.messages[1].code === '000000' ? '000001' : '000000'
+    const failedVerification = await app.inject({
+      method: 'POST',
+      url: '/api/admin/auth/otp/verify',
+      payload: { email: 'admin@example.com', code: wrongCode }
+    })
+    expect(failedVerification.statusCode).toBe(401)
+    expect(failedVerification.json().error).toContain('incorrect or expired')
+    expect(failedVerification.body).not.toContain(delivery.messages[1].code)
+    const verification = await app.inject({
+      method: 'POST',
+      url: '/api/admin/auth/otp/verify',
+      payload: { email: 'admin@example.com', code: delivery.messages[1].code }
+    })
+    expect(verification.statusCode).toBe(200)
+    expect(verification.body).not.toContain(delivery.messages[1].code)
+    const administrator = verification.json() as {
+      sessionId: string
+      token: string
+      expiresAt: string
+    }
+    const sessionStatus = await app.inject({
+      method: 'GET',
+      url: '/api/admin/auth/session',
+      headers: authorizationHeader(administrator)
+    })
+    expect(sessionStatus.statusCode).toBe(200)
+    expect(sessionStatus.json()).toMatchObject({ authenticated: true })
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/admin/console',
+      headers: { authorization: `Bearer ${administrator.sessionId}.${administrator.token}` }
+    })
+    expect(response.statusCode).toBe(200)
+    expect(response.json().metrics.totalAssessments).toBe(1)
+    expect(JSON.stringify(response.json())).not.toContain('CorrectOptionId')
+    const insights = await app.inject({
+      method: 'GET',
+      url: '/api/admin/attempts/attempt-1/insights?assessmentId=a1',
+      headers: { authorization: `Bearer ${administrator.sessionId}.${administrator.token}` }
+    })
+    expect(insights.statusCode).toBe(200)
+    expect(insights.json().status).toBe('not_configured')
+    await app.close()
+  })
+  it('requires an allowlisted administrator session for question generation and returns provider metadata', async () => {
+    const delivery = new TestDelivery()
+    const assessment = assessmentService()
+    const auth = new OtpAuthService(assessment, delivery, 'test-secret', () => 1_000, [
+      'admin@example.com'
+    ])
+    const questions = [
+      {
+        id: 'temporary-1',
+        prompt: 'Which structure contains genetic material?',
+        options: [
+          { id: 'A', text: 'Nucleus' },
+          { id: 'B', text: 'Cell wall' },
+          { id: 'C', text: 'Ribosome' },
+          { id: 'D', text: 'Vacuole' }
+        ],
+        correctOptionId: 'A',
+        explanation: 'The nucleus contains the genetic material.',
+        difficulty: 'Medium' as const,
+        topic: 'Cell structure',
+        order: 1
+      }
+    ]
+    const provider: QuestionGenerationProvider = {
+      provider: 'Test provider',
+      model: 'test-model',
+      async generate() {
+        return questions
+      }
+    }
+    const app = createApp(assessment, auth, undefined, undefined, provider)
+    const payload = {
+      subject: 'Biology',
+      topic: 'Cell structure',
+      learningObjectives: 'Compare cell components.',
+      difficulty: 'Medium',
+      questionCount: 1,
+      optionCount: 4,
+      questionType: 'MCQ',
+      audience: 'Grade 10',
+      instructions: '',
+      language: 'English'
+    }
+    const unauthorized = await app.inject({
+      method: 'POST',
+      url: '/api/admin/question-generator/generate',
+      payload
+    })
+    expect(unauthorized.statusCode).toBe(401)
+
+    await auth.requestAdminOtp('admin@example.com', 'ip')
+    const session = auth.verifyAdminOtp('admin@example.com', delivery.messages[0].code)
+    const generated = await app.inject({
+      method: 'POST',
+      url: '/api/admin/question-generator/generate',
+      headers: authorizationHeader(session),
+      payload
+    })
+    expect(generated.statusCode).toBe(200)
+    expect(generated.json()).toMatchObject({
+      provider: 'Test provider',
+      model: 'test-model',
+      questions
+    })
+    await app.close()
+  })
   it('returns metadata without questions and requires OTP for question retrieval', async () => {
     const delivery = new TestDelivery()
     const service = assessmentService()
@@ -129,6 +427,44 @@ describe('assessment API', () => {
     expect(questions.json().questions).toHaveLength(1)
     expect(questions.body).not.toContain('CorrectOptionId')
     await app.close()
+  })
+
+  it('records report exports with the verified administrator as actor', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'pearl-admin-api-test-'))
+    const delivery = new TestDelivery()
+    const auth = new OtpAuthService(assessmentService(), delivery, 'test-secret', () => 1_000, [
+      'admin@example.com'
+    ])
+    const app = createApp(
+      assessmentService(),
+      auth,
+      undefined,
+      new AdminActionAuditStore(join(directory, 'admin-actions.jsonl'))
+    )
+    try {
+      await auth.requestAdminOtp('admin@example.com', 'ip')
+      const session = auth.verifyAdminOtp('admin@example.com', delivery.messages[0].code)
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/admin/audit',
+        headers: { authorization: `Bearer ${session.sessionId}.${session.token}` },
+        payload: { action: 'report_export', targetId: 'attempts' }
+      })
+      expect(response.statusCode).toBe(202)
+      const event = JSON.parse(readFileSync(join(directory, 'admin-actions.jsonl'), 'utf8')) as {
+        actorEmail: string
+        action: string
+        targetId: string
+      }
+      expect(event).toMatchObject({
+        actorEmail: 'admin@example.com',
+        action: 'report_export',
+        targetId: 'attempts'
+      })
+    } finally {
+      await app.close()
+      rmSync(directory, { recursive: true, force: true })
+    }
   })
 
   it('invokes OTP delivery without returning the code', async () => {
@@ -180,6 +516,29 @@ describe('assessment API', () => {
     await app.close()
   })
 
+  it('offers specific guidance when Airtable refuses a new status option', async () => {
+    const app = createApp({
+      createAttempt: async () => {
+        throw new AirtableRequestError(
+          422,
+          'INVALID_MULTIPLE_CHOICE_OPTIONS',
+          'Insufficient permissions to create new select option "expired"'
+        )
+      }
+    } as never)
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/assessments/a1/attempts',
+      headers: { authorization: 'Bearer test-token' },
+      payload: { participantDisplayName: 'Participant' }
+    })
+    expect(response.statusCode).toBe(502)
+    expect(response.json().error).toContain('Single select')
+    expect(response.json().error).toContain('in_progress')
+    expect(response.json().error).toContain('expired')
+    await app.close()
+  })
+
   it('allows a verified session and binds it to its attempt', async () => {
     const clock = { value: 1_000 }
     const delivery = new TestDelivery()
@@ -200,6 +559,7 @@ describe('assessment API', () => {
         code: delivery.messages[0].code
       }
     })
+    expect(verification.statusCode).toBe(200)
     const session = verification.json()
     const attempt = await app.inject({
       method: 'POST',
@@ -411,6 +771,80 @@ describe('assessment API', () => {
     })
     expect(afterSubmission.statusCode).toBe(400)
     await app.close()
+  })
+
+  it('accepts a deadline-triggered final submission only after the backend deadline', async () => {
+    const auditStore = new AssessmentAuditStore()
+    const service = assessmentService(auditStore)
+    const delivery = new TestDelivery()
+    const auth = new OtpAuthService(service, delivery, 'test-secret')
+    const app = createApp(service, auth)
+    await app.inject({
+      method: 'POST',
+      url: '/api/auth/otp/request',
+      payload: { email: 'deadline@example.com', assessmentId: 'a1' }
+    })
+    const verification = await app.inject({
+      method: 'POST',
+      url: '/api/auth/otp/verify',
+      payload: {
+        email: 'deadline@example.com',
+        assessmentId: 'a1',
+        code: delivery.messages[0].code
+      }
+    })
+    expect(verification.statusCode).toBe(200)
+    const session = verification.json()
+    const authorization = `Bearer ${session.sessionId}.${session.token}`
+    const attempt = await app.inject({
+      method: 'POST',
+      url: '/api/assessments/a1/attempts',
+      headers: { authorization },
+      payload: { participantDisplayName: 'Deadline participant' }
+    })
+    expect(attempt.statusCode).toBe(200)
+    const attemptId = attempt.json().attemptId as string
+    const attemptRecord = attempts.find((record) => record.fields.AttemptId === attemptId)
+    expect(attemptRecord).toBeDefined()
+    attemptRecord!.fields.StartedAt = new Date(Date.now() - 6 * 60_000).toISOString()
+
+    const unmarkedSubmission = await app.inject({
+      method: 'POST',
+      url: `/api/attempts/${attemptId}/submissions`,
+      headers: { authorization },
+      payload: { assessmentId: 'a1', answers: [] }
+    })
+    expect(unmarkedSubmission.statusCode).toBe(400)
+
+    const deadlineSubmission = await app.inject({
+      method: 'POST',
+      url: `/api/attempts/${attemptId}/submissions`,
+      headers: { authorization },
+      payload: { assessmentId: 'a1', answers: [], trigger: 'deadline' }
+    })
+    expect(deadlineSubmission.statusCode).toBe(200)
+    expect(deadlineSubmission.json()).toMatchObject({ status: 'accepted' })
+
+    const recorded = await app.inject({
+      method: 'POST',
+      url: `/api/attempts/${attemptId}/events`,
+      headers: { authorization },
+      payload: { assessmentId: 'a1', type: 'automatic_submission_deadline' }
+    })
+    expect(recorded.statusCode).toBe(202)
+    expect(auditStore.list(attemptId).map((event) => event.type)).toContain(
+      'automatic_submission_deadline'
+    )
+    await app.close()
+  })
+
+  it('prevents a participant from creating a second active attempt', async () => {
+    const service = assessmentService()
+    await service.createAttempt('a1', 'Same participant', undefined, 'one-attempt@example.com')
+
+    await expect(
+      service.createAttempt('a1', 'Same participant', undefined, 'one-attempt@example.com')
+    ).rejects.toThrow('An active assessment attempt already exists for this account.')
   })
 
   it('reports health and rejects invalid attempts', async () => {

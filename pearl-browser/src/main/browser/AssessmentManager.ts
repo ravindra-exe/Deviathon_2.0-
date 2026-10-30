@@ -4,6 +4,7 @@ import type {
   AssessmentConfiguration,
   AssessmentEvent,
   AssessmentSession,
+  AutomaticSubmissionTrigger,
   ProctoringInsightResult
 } from '../../shared/assessment'
 import type { AssessmentProvider } from './AssessmentProvider'
@@ -36,6 +37,8 @@ export class AssessmentManager {
   private session = EMPTY_SESSION()
   private expirationTimer: NodeJS.Timeout | undefined
   private sessionGeneration = 0
+  private submissionPromise: Promise<AssessmentSession> | undefined
+  private readonly recordedAutomaticTriggers = new Set<AutomaticSubmissionTrigger>()
 
   constructor(
     private readonly provider: AssessmentProvider,
@@ -86,9 +89,25 @@ export class AssessmentManager {
     return this.getState()
   }
 
+  acknowledgePolicy(acknowledged: boolean): AssessmentSession {
+    this.requireStatus('ready')
+    if (!this.session.participant) {
+      throw new Error('Authenticate before acknowledging the assessment policy.')
+    }
+    this.session = { ...this.session, policyAcknowledged: acknowledged }
+    this.publish()
+    return this.getState()
+  }
+
   async begin(): Promise<AssessmentSession> {
     this.requireStatus('ready')
     if (!this.session.participant) throw new Error('Authenticate before beginning the assessment.')
+    if (
+      this.session.configuration?.provider === 'remote-backend' &&
+      !this.session.policyAcknowledged
+    ) {
+      throw new Error('Review and acknowledge the assessment policy before starting.')
+    }
     const participant = this.session.participant
     this.session = { ...this.session, status: 'authenticating', error: undefined }
     this.publish()
@@ -97,6 +116,7 @@ export class AssessmentManager {
         const attempt = this.provider.startAttempt
           ? await this.provider.startAttempt(this.session.configuration!, participant)
           : { attemptId: `local-attempt-${Date.now()}` }
+        this.recordedAutomaticTriggers.clear()
         this.session = {
           ...this.session,
           attemptId: attempt.attemptId,
@@ -172,7 +192,11 @@ export class AssessmentManager {
     }
     const answers = this.session.answers.filter((answer) => answer.questionId !== questionId)
     answers.push({ questionId, optionIndex })
-    this.session = { ...this.session, answers, error: undefined }
+    this.session = {
+      ...this.session,
+      answers,
+      error: this.session.submissionFailure
+    }
     this.addEvent('answer_changed', `Answer recorded for ${questionId}.`)
     return this.getState()
   }
@@ -188,29 +212,90 @@ export class AssessmentManager {
     return this.getState()
   }
 
-  async submit(): Promise<AssessmentSession> {
-    if (this.session.status === 'submitted') return this.getState()
+  submit(trigger?: AutomaticSubmissionTrigger): Promise<AssessmentSession> {
+    if (this.session.status === 'submitted') return Promise.resolve(this.getState())
+    if (this.submissionPromise) {
+      const pendingSubmission = this.submissionPromise
+      if (trigger) {
+        return this.recordAutomaticTrigger(trigger).then(() => pendingSubmission)
+      }
+      return pendingSubmission
+    }
     this.requireStatus('in_progress', 'expired')
+    if (
+      this.session.status === 'in_progress' &&
+      this.session.deadline &&
+      this.clock.now() >= Date.parse(this.session.deadline)
+    ) {
+      this.expire()
+      return this.submit('deadline')
+    }
     if (this.session.status === 'in_progress') this.ensureNotExpired()
+    const effectiveTrigger =
+      trigger ??
+      (this.session.status === 'expired' ? this.session.automaticSubmissionTrigger : undefined)
+    const operation = this.performSubmission(effectiveTrigger)
+    this.submissionPromise = operation
+    const clearPending = (): void => {
+      if (this.submissionPromise === operation) this.submissionPromise = undefined
+    }
+    void operation.then(clearPending, clearPending)
+    return operation
+  }
+
+  private async recordAutomaticTrigger(trigger: AutomaticSubmissionTrigger): Promise<void> {
+    if (this.recordedAutomaticTriggers.has(trigger)) return
+    this.recordedAutomaticTriggers.add(trigger)
+    const eventTypes: Record<AutomaticSubmissionTrigger, AssessmentActivityEvent['type']> = {
+      focus_loss: 'automatic_submission_focus_loss',
+      minimized: 'automatic_submission_minimized',
+      close_attempt: 'automatic_submission_close_attempt',
+      deadline: 'automatic_submission_deadline'
+    }
+    this.session = {
+      ...this.session,
+      automaticSubmissionTrigger: this.session.automaticSubmissionTrigger ?? trigger
+    }
+    await this.recordActivityEvent({ type: eventTypes[trigger] })
+  }
+
+  private async performSubmission(
+    trigger?: AutomaticSubmissionTrigger
+  ): Promise<AssessmentSession> {
     const previousStatus = this.session.status
-    this.session = { ...this.session, status: 'submitting' }
+    this.session = { ...this.session, status: 'submitting', error: undefined }
+    if (trigger) void this.recordAutomaticTrigger(trigger)
     this.addEvent('submission_started', 'Assessment submission started.')
     try {
       const submission = await this.provider.submitAnswers(
         this.session.configuration!,
         this.session.answers,
-        this.session.attemptId
+        this.session.attemptId,
+        trigger
       )
-      this.session = { ...this.session, status: 'submitted', submission }
+      if (submission.status !== 'accepted') {
+        throw new Error(
+          submission.message || 'The assessment server has not confirmed the submission yet.'
+        )
+      }
+      this.session = {
+        ...this.session,
+        status: 'submitted',
+        submission,
+        submissionFailure: undefined,
+        error: undefined
+      }
       this.addEvent('submitted', submission.message)
       void this.recordActivityEvent({ type: 'assessment_submitted' })
       this.clearTimer()
       return this.getState()
     } catch (error) {
+      const message = error instanceof Error ? error.message : 'Assessment submission failed.'
       this.session = {
         ...this.session,
         status: previousStatus,
-        error: error instanceof Error ? error.message : 'Assessment submission failed.'
+        error: message,
+        submissionFailure: message
       }
       this.addEvent('failed', this.session.error ?? 'Assessment submission failed.')
       return this.getState()
@@ -220,8 +305,10 @@ export class AssessmentManager {
   async recordActivityEvent(event: AssessmentActivityEvent): Promise<void> {
     const isConfirmedSubmission =
       event.type === 'assessment_submitted' && this.session.status === 'submitted'
+    const isAutomaticSubmission =
+      event.type.startsWith('automatic_submission_') && this.session.status === 'submitting'
     if (
-      (this.session.status !== 'in_progress' && !isConfirmedSubmission) ||
+      (this.session.status !== 'in_progress' && !isConfirmedSubmission && !isAutomaticSubmission) ||
       !this.session.attemptId ||
       this.session.configuration?.provider !== 'remote-backend'
     ) {
@@ -238,7 +325,10 @@ export class AssessmentManager {
       source:
         safeEvent.type === 'assessment_started' || safeEvent.type === 'assessment_submitted'
           ? 'assessment'
-          : safeEvent.type.startsWith('camera_') || safeEvent.type.startsWith('face_')
+          : safeEvent.type.startsWith('camera_') ||
+              safeEvent.type.startsWith('face_') ||
+              safeEvent.type.startsWith('attention_') ||
+              safeEvent.type.startsWith('sustained_head_')
             ? 'webcam'
             : 'browser',
       severity:
@@ -247,10 +337,14 @@ export class AssessmentManager {
         safeEvent.type === 'tab_creation_blocked' ||
         safeEvent.type === 'face_not_detected' ||
         safeEvent.type === 'multiple_faces_detected' ||
+        safeEvent.type === 'sustained_head_turn_left' ||
+        safeEvent.type === 'sustained_head_turn_right' ||
+        safeEvent.type === 'sustained_head_down' ||
         safeEvent.type === 'camera_stopped' ||
         safeEvent.type === 'camera_permission_denied' ||
         safeEvent.type === 'camera_unavailable' ||
-        safeEvent.type === 'camera_disconnected'
+        safeEvent.type === 'camera_disconnected' ||
+        safeEvent.type.startsWith('automatic_submission_')
           ? 'warning'
           : 'info',
       storageStatus: 'pending'
@@ -321,6 +415,9 @@ export class AssessmentManager {
   }
 
   async cancel(): Promise<AssessmentSession> {
+    if (this.session.submissionFailure) {
+      throw new Error('Retry the failed submission before leaving this assessment.')
+    }
     this.clearTimer()
     this.sessionGeneration += 1
     this.session = EMPTY_SESSION()
@@ -380,7 +477,17 @@ export class AssessmentManager {
   private ensureNotExpired(): void {
     if (this.session.deadline && this.clock.now() >= Date.parse(this.session.deadline)) {
       this.expire()
+      this.submitAtDeadline()
       throw new Error('Assessment time has expired.')
+    }
+  }
+
+  private submitAtDeadline(): void {
+    if (
+      this.session.status === 'expired' &&
+      this.session.configuration?.policy.expirationBehavior === 'submit'
+    ) {
+      void this.submit('deadline')
     }
   }
 
@@ -397,7 +504,7 @@ export class AssessmentManager {
     this.expirationTimer = this.clock.setTimeout(() => {
       if (generation !== this.sessionGeneration || this.session.status !== 'in_progress') return
       this.expire()
-      if (this.session.configuration?.policy.expirationBehavior === 'submit') void this.submit()
+      this.submitAtDeadline()
     }, delay)
   }
 

@@ -49,7 +49,7 @@ non-empty `id` and a non-empty `text`, for example:
 | `ParticipantEmail`       | Single line text | `participant@example.com`               |
 | `StartedAt`              | Date/time        | generated                               |
 | `SubmittedAt`            | Date/time        | generated on submission                 |
-| `Status`                 | Single line text | `in_progress`, `submitted`, or `expired` |
+| `Status`                 | Single select    | `in_progress`, `submitted`, or `expired` |
 | `AnswersJSON`            | Long text        | `[{"questionId":"q1","optionIndex":0}]` |
 | `SubmissionId`           | Single line text | generated UUID                          |
 
@@ -74,9 +74,15 @@ The backend writes these fields when Airtable confirms an authenticated attempt:
 `AttemptId` (single line text UUID), `AssessmentId` (single line text),
 `ParticipantDisplayName` (single line text), `ParticipantEmail` (single line
 text from the verified server session), `StartedAt` (date/time in ISO 8601),
-`Status` (single line text), and `AnswersJSON` (long text). Submission also
-writes `SubmittedAt` (date/time), `SubmissionId` (single line text), and updates
-`Status` and `AnswersJSON`.
+`Status` (single select with exactly `in_progress`, `submitted`, and `expired`),
+and `AnswersJSON` (long text). Submission also writes `SubmittedAt` (date/time),
+`SubmissionId` (single line text), and updates `Status` and `AnswersJSON`.
+
+If Airtable rejects a write with `HTTP 422 INVALID_MULTIPLE_CHOICE_OPTIONS`,
+open the configured base, select the `Attempts` table, and edit the `Status`
+field to be a **Single select** whose options include exactly `in_progress`,
+`submitted`, and `expired`. Airtable will reject updates that try to create a
+new custom option not already in that list.
 
 If Airtable returns `HTTP 422 UNKNOWN_FIELD_NAME` for `ParticipantEmail`, open
 the configured base, select the `Attempts` table, add a new field named exactly

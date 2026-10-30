@@ -5,6 +5,7 @@ import type {
   AssessmentParticipant,
   AssessmentQuestion,
   AssessmentSubmission,
+  AutomaticSubmissionTrigger,
   ProctoringInsightResult
 } from '../../shared/assessment'
 
@@ -24,7 +25,8 @@ export interface AssessmentProvider extends AssessmentIdentityProvider {
   submitAnswers(
     configuration: AssessmentConfiguration,
     answers: ReadonlyArray<{ questionId: string; optionIndex: number }>,
-    attemptId?: string
+    attemptId?: string,
+    trigger?: AutomaticSubmissionTrigger
   ): Promise<AssessmentSubmission>
   requestOtp?(email: string, assessmentId: string): Promise<void>
   recordActivityEvent?(

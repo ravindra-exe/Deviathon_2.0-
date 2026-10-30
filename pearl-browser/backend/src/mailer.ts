@@ -27,7 +27,10 @@ export class SmtpOtpDelivery implements OtpDelivery {
       host: config.host,
       port: config.port,
       secure: config.secure,
-      auth: { user: config.user, pass: config.pass }
+      auth: { user: config.user, pass: config.pass },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 20_000
     })
     this.from = config.from
   }

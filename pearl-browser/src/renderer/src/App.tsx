@@ -4,6 +4,7 @@ import { BrowserPanels } from './components/BrowserPanels'
 import { NavigationToolbar } from './components/NavigationToolbar'
 import { TabStrip } from './components/TabStrip'
 import { AssessmentExperience } from './components/AssessmentExperience'
+import { AdminConsole } from './components/AdminConsole'
 
 const initialState: BrowserState = {
   tabs: [],
@@ -117,6 +118,7 @@ function App(): React.JSX.Element {
     null
   )
   const [assessmentMode, setAssessmentMode] = useState(false)
+  const [adminMode, setAdminMode] = useState(false)
   const activeTab = useMemo(() => state.tabs.find((tab) => tab.id === state.activeTabId), [state])
   const isBookmarked = Boolean(
     activeTab && state.bookmarks.some((bookmark) => bookmark.url === activeTab.url)
@@ -189,7 +191,14 @@ function App(): React.JSX.Element {
     return () => window.removeEventListener('keydown', onKeyDown)
   })
 
-  return assessmentMode ? (
+  return adminMode ? (
+    <AdminConsole
+      onExit={() => {
+        setAdminMode(false)
+        void window.browser.admin.close().catch((error: unknown) => console.error(error))
+      }}
+    />
+  ) : assessmentMode ? (
     <AssessmentExperience
       browserState={state}
       onBrowserCommand={command}
@@ -225,6 +234,12 @@ function App(): React.JSX.Element {
         onAssessment={() => {
           setAssessmentMode(true)
           command({ type: 'set-panel-open', open: true })
+        }}
+        onAdmin={() => {
+          void window.browser.admin
+            .open()
+            .then(() => setAdminMode(true))
+            .catch((error: unknown) => console.error(error))
         }}
       />
       {activeTab?.errorMessage && (

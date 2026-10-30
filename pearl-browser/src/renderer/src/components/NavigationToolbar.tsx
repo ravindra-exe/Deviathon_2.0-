@@ -9,6 +9,7 @@ interface NavigationToolbarProps {
   onBookmark: () => void
   onPanel: (panel: 'bookmarks' | 'history' | 'downloads' | 'settings') => void
   onAssessment: () => void
+  onAdmin: () => void
   assessmentSurface?: boolean
 }
 
@@ -20,6 +21,7 @@ export function NavigationToolbar({
   onBookmark,
   onPanel,
   onAssessment,
+  onAdmin,
   assessmentSurface = false
 }: NavigationToolbarProps): React.JSX.Element {
   const [address, setAddress] = useState(
@@ -115,6 +117,9 @@ export function NavigationToolbar({
         title="Choose live assessment or demo mode"
       >
         Assessment
+      </button>
+      <button className="toolbar-button admin-console-launch" onClick={onAdmin}>
+        Admin Console
       </button>
         </>
       )}

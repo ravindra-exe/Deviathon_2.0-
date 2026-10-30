@@ -5,6 +5,7 @@ import type {
   AssessmentParticipant,
   AssessmentQuestion,
   AssessmentSubmission,
+  AutomaticSubmissionTrigger,
   ProctoringInsightResult
 } from '../../shared/assessment'
 import type { AssessmentProvider } from './AssessmentProvider'
@@ -13,6 +14,7 @@ interface RemoteAssessmentProviderOptions {
   baseUrl: string
   assessmentId: string
   timeoutMs?: number
+  otpRequestTimeoutMs?: number
   useDevelopmentEnrollment?: boolean
 }
 
@@ -71,6 +73,7 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
   private readonly baseUrl: string
   private readonly assessmentId: string
   private readonly timeoutMs: number
+  private readonly otpRequestTimeoutMs: number
   private readonly useDevelopmentEnrollment: boolean
   private enrollmentToken?: string
   private sessionCredential?: string
@@ -81,6 +84,7 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
     this.baseUrl = options.baseUrl.replace(/\/+$/, '')
     this.assessmentId = options.assessmentId
     this.timeoutMs = options.timeoutMs ?? 10_000
+    this.otpRequestTimeoutMs = options.otpRequestTimeoutMs ?? 45_000
     this.useDevelopmentEnrollment = options.useDevelopmentEnrollment === true
   }
 
@@ -94,7 +98,7 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
         `/api/assessments/${encodeURIComponent(this.assessmentId)}`
       )
     } catch (error) {
-      throw operationError('load published assessment metadata', error)
+      throw operationError('load published assessment metadata', error, this.baseUrl)
     }
     const assessment = response.assessment
     const configuration: AssessmentConfiguration = {
@@ -126,7 +130,7 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
         `/api/assessments/${encodeURIComponent(configuration.id)}/questions`
       )
     } catch (error) {
-      throw operationError('load assessment questions', error)
+      throw operationError('load assessment questions', error, this.baseUrl)
     }
     return response.questions
   }
@@ -149,12 +153,16 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
 
   async requestOtp(email: string): Promise<void> {
     try {
-      await this.request('/api/auth/otp/request', {
-        method: 'POST',
-        body: JSON.stringify({ email, assessmentId: this.assessmentId })
-      })
+      await this.request(
+        '/api/auth/otp/request',
+        {
+          method: 'POST',
+          body: JSON.stringify({ email, assessmentId: this.assessmentId })
+        },
+        this.otpRequestTimeoutMs
+      )
     } catch (error) {
-      throw operationError('send OTP email', error)
+      throw operationError('send OTP email', error, this.baseUrl)
     }
   }
 
@@ -164,14 +172,35 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
       return this.authenticate(normalizedEmail)
     }
     if (this.sessionCredential) await this.logout()
-    let response: { sessionId: string; token: string }
+    let response: {
+      sessionId: string
+      token: string
+      assessmentId: string
+      expiresAt: string
+    }
     try {
-      response = await this.request<{ sessionId: string; token: string }>('/api/auth/otp/verify', {
+      response = await this.request<{
+        sessionId: string
+        token: string
+        assessmentId: string
+        expiresAt: string
+      }>('/api/auth/otp/verify', {
         method: 'POST',
-        body: JSON.stringify({ email, assessmentId: this.assessmentId, code })
+        body: JSON.stringify({ email: normalizedEmail, assessmentId: this.assessmentId, code })
       })
     } catch (error) {
-      throw operationError('verify OTP', error)
+      throw operationError('verify OTP', error, this.baseUrl)
+    }
+    if (
+      typeof response.sessionId !== 'string' ||
+      !response.sessionId ||
+      typeof response.token !== 'string' ||
+      !response.token ||
+      response.assessmentId !== this.assessmentId ||
+      !Number.isFinite(Date.parse(response.expiresAt)) ||
+      Date.parse(response.expiresAt) <= Date.now()
+    ) {
+      throw new Error('The authentication server returned an invalid session.')
     }
     this.sessionCredential = `${response.sessionId}.${response.token}`
     this.authenticatedEmail = normalizedEmail
@@ -204,7 +233,7 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
         }
       )
     } catch (error) {
-      throw operationError('create authenticated assessment attempt', error)
+      throw operationError('create authenticated assessment attempt', error, this.baseUrl)
     }
     if (
       typeof response.attemptId !== 'string' ||
@@ -224,7 +253,8 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
   async submitAnswers(
     configuration: AssessmentConfiguration,
     answers: ReadonlyArray<{ questionId: string; optionIndex: number }>,
-    attemptId?: string
+    attemptId?: string,
+    trigger?: AutomaticSubmissionTrigger
   ): Promise<AssessmentSubmission> {
     if (!attemptId) throw new Error('Remote assessment attempt is unavailable.')
     let response: SubmissionResponse
@@ -238,12 +268,25 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
             answers: answers.map((answer) => ({
               questionId: answer.questionId,
               optionIndex: answer.optionIndex
-            }))
+            })),
+            ...(trigger === 'deadline' ? { trigger } : {})
           })
         }
       )
     } catch (error) {
-      throw operationError('submit assessment answers', error)
+      throw operationError('submit assessment answers', error, this.baseUrl)
+    }
+    if (response.status !== 'accepted') {
+      throw new Error(
+        response.message || 'The assessment server has not confirmed the submission yet.'
+      )
+    }
+    if (
+      !response.submissionId ||
+      !Number.isFinite(Date.parse(response.submittedAt)) ||
+      typeof response.message !== 'string'
+    ) {
+      throw new Error('The assessment server returned an incomplete submission confirmation.')
     }
     return {
       id: response.submissionId,
@@ -285,9 +328,13 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
     )
   }
 
-  private async request<T>(path: string, init?: RequestInit): Promise<T> {
+  private async request<T>(
+    path: string,
+    init?: RequestInit,
+    timeoutMs = this.timeoutMs
+  ): Promise<T> {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs)
+    const timer = setTimeout(() => controller.abort(), timeoutMs)
     try {
       const response = await fetch(`${this.baseUrl}${path}`, {
         ...init,
@@ -316,7 +363,22 @@ export class RemoteAssessmentProvider implements AssessmentProvider {
   }
 }
 
-function operationError(operation: string, error: unknown): Error {
+function operationError(operation: string, error: unknown, baseUrl: string): Error {
   const detail = error instanceof Error ? error.message : 'The backend request failed.'
-  return new Error(`Failed to ${operation}: ${detail}`)
+  if (error instanceof TypeError && detail.toLowerCase().includes('fetch failed')) {
+    let destination = 'the configured assessment backend'
+    try {
+      destination = new URL(baseUrl).origin
+    } catch {
+      return new Error(
+        `Failed to ${operation}: Could not connect to ${destination}. Check the backend URL and start it with "npm run backend:dev".`,
+        { cause: error }
+      )
+    }
+    return new Error(
+      `Failed to ${operation}: Could not connect to ${destination}. Check that the backend is running and that PEARL_ASSESSMENT_BACKEND_URL matches its address.`,
+      { cause: error }
+    )
+  }
+  return new Error(`Failed to ${operation}: ${detail}`, { cause: error })
 }

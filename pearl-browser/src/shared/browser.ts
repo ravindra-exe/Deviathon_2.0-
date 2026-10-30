@@ -1,4 +1,5 @@
 import type { AssessmentAPI } from './assessment'
+import type { AdminConsoleAPI } from './admin'
 
 export interface BrowserTabState {
   id: string
@@ -102,4 +103,5 @@ export interface BrowserAPI {
   onStateChange(listener: (state: BrowserState) => void): () => void
   onFocusAddress(listener: () => void): () => void
   assessment: AssessmentAPI
+  admin: AdminConsoleAPI
 }

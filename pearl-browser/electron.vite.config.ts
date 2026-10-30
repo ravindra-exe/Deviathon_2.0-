@@ -7,6 +7,9 @@ export default defineConfig({
   preload: {},
   renderer: {
     publicDir: resolve('src/renderer/public'),
+    worker: {
+      format: 'es'
+    },
     resolve: {
       alias: {
         '@renderer': resolve('src/renderer/src')

@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import type { BrowserAPI, BrowserCommand, BrowserState } from '../shared/browser'
 import type { AssessmentAPI, AssessmentActivityEvent } from '../shared/assessment'
+import type { AdminConsoleAPI } from '../shared/admin'
 
 const assessment: AssessmentAPI = {
   getState: () => ipcRenderer.invoke('assessment:get-state'),
@@ -20,6 +21,8 @@ const assessment: AssessmentAPI = {
     ipcRenderer.invoke('assessment:set-camera-consent', consented),
   setCameraReadiness: (ready: boolean) =>
     ipcRenderer.invoke('assessment:set-camera-readiness', ready),
+  acknowledgePolicy: (acknowledged) =>
+    ipcRenderer.invoke('assessment:acknowledge-policy', acknowledged),
   getProctoringInsights: () => ipcRenderer.invoke('assessment:get-proctoring-insights'),
   onStateChange: (listener) => {
     const handler = (
@@ -45,7 +48,23 @@ const browser: BrowserAPI = {
     ipcRenderer.on('browser-focus-address', handler)
     return () => ipcRenderer.removeListener('browser-focus-address', handler)
   },
-  assessment
+  assessment,
+  admin: {
+    open: () => ipcRenderer.invoke('admin:open'),
+    close: () => ipcRenderer.invoke('admin:close'),
+    requestOtp: (email) => ipcRenderer.invoke('admin:request-otp', email),
+    verifyOtp: (email, code) => ipcRenderer.invoke('admin:verify-otp', email, code),
+    resume: () => ipcRenderer.invoke('admin:resume'),
+    getData: () => ipcRenderer.invoke('admin:get-data'),
+    generateQuestions: (request) => ipcRenderer.invoke('admin:generate-questions', request),
+    saveAssessmentDraft: (draft) => ipcRenderer.invoke('admin:save-assessment-draft', draft),
+    publishAssessment: (assessmentId) =>
+      ipcRenderer.invoke('admin:publish-assessment', assessmentId),
+    getInsights: (attemptId, assessmentId) =>
+      ipcRenderer.invoke('admin:get-insights', attemptId, assessmentId),
+    recordExport: (targetId) => ipcRenderer.invoke('admin:record-export', targetId),
+    logout: () => ipcRenderer.invoke('admin:logout')
+  } satisfies AdminConsoleAPI
 }
 
 if (process.contextIsolated) contextBridge.exposeInMainWorld('browser', browser)

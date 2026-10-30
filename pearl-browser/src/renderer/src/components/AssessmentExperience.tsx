@@ -23,6 +23,23 @@ const initialSession: AssessmentSession = {
 
 /** Cooldown duration for OTP resend in ms */
 const OTP_RESEND_COOLDOWN_MS = 60_000
+const genericOtpFailure = 'Authentication failed.'
+
+function getOtpErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : ''
+  if (message.includes(genericOtpFailure)) {
+    return 'We could not verify that code. It may be incorrect, expired, or from a different or restarted backend. Request a fresh code and enter it within five minutes.'
+  }
+  return message || 'Verification failed. Please try again.'
+}
+
+function getOtpRequestErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : ''
+  if (message.includes('Remote assessment backend timed out.')) {
+    return 'The server did not confirm delivery in time. A code may still arrive, so check your inbox and spam folder. If it does not arrive, request another code after the 60-second cooldown.'
+  }
+  return message || 'Failed to send verification code. Please try again.'
+}
 
 const activityDescriptions: Record<AssessmentActivityEventType, string> = {
   assessment_started: 'Authenticated assessment attempt started',
@@ -45,7 +62,16 @@ const activityDescriptions: Record<AssessmentActivityEventType, string> = {
   face_not_detected: 'Face not detected',
   face_detected: 'Face detected',
   multiple_faces_detected: 'Multiple faces detected',
-  camera_disconnected: 'Camera disconnected'
+  camera_disconnected: 'Camera disconnected',
+  attention_monitoring_started: 'Attention monitoring started',
+  sustained_head_turn_left: 'Sustained head turn left',
+  sustained_head_turn_right: 'Sustained head turn right',
+  sustained_head_down: 'Sustained head tilt or downward direction',
+  attention_returned: 'Returned to calibrated viewing direction',
+  automatic_submission_focus_loss: 'Automatic submission triggered after application focus loss',
+  automatic_submission_minimized: 'Automatic submission triggered after application minimized',
+  automatic_submission_close_attempt: 'Automatic submission triggered by application close attempt',
+  automatic_submission_deadline: 'Automatic submission triggered at the assessment deadline'
 }
 
 function describeActivity(entry: AssessmentActivityLogEntry): string {
@@ -55,7 +81,11 @@ function describeActivity(entry: AssessmentActivityLogEntry): string {
   if (
     (entry.type === 'face_not_detected' ||
       entry.type === 'face_detected' ||
-      entry.type === 'multiple_faces_detected') &&
+      entry.type === 'multiple_faces_detected' ||
+      entry.type === 'sustained_head_turn_left' ||
+      entry.type === 'sustained_head_turn_right' ||
+      entry.type === 'sustained_head_down' ||
+      entry.type === 'attention_returned') &&
     entry.observationDurationMs !== undefined
   ) {
     return `${activityDescriptions[entry.type]} for ${Math.round(entry.observationDurationMs / 1000)} seconds (${entry.observationCount ?? 0} observations)`
@@ -97,19 +127,13 @@ export function AssessmentExperience({
   const [loading, setLoading] = useState(false)
   const [confirmSubmit, setConfirmSubmit] = useState(false)
   const [activityOpen, setActivityOpen] = useState(false)
-  const [cameraReady, setCameraReady] = useState(false)
+  const [cameraReadySessionKey, setCameraReadySessionKey] = useState<string>()
   const [beginningExam, setBeginningExam] = useState(false)
-  const [proctoringSummary, setProctoringSummary] = useState<ProctoringInsightResult | undefined>()
-  const [proctoringSummaryLoading, setProctoringSummaryLoading] = useState(false)
-
-  const handleCameraReadinessChange = useCallback((ready: boolean): void => {
-    setCameraReady(ready)
-  }, [])
-
-  useEffect(() => {
-    setProctoringSummary(undefined)
-    setProctoringSummaryLoading(false)
-  }, [session.attemptId])
+  const [proctoringSummaryState, setProctoringSummaryState] = useState<{
+    attemptId?: string
+    result?: ProctoringInsightResult
+    loading: boolean
+  }>({ loading: false })
 
   useEffect(() => {
     void window.browser.assessment.getState().then((nextSession) => {
@@ -147,6 +171,10 @@ export function AssessmentExperience({
   }, [lastOtpRequestTime])
 
   const configuration = session.configuration
+  const cameraSessionKey =
+    configuration?.provider === 'remote-backend' && session.participant
+      ? `${configuration.id}:${session.participant.id}`
+      : undefined
   const activeBrowserTab = browserState.tabs.find((tab) => tab.id === browserState.activeTabId)
   const activeBrowserTabIsBookmarked = Boolean(
     activeBrowserTab &&
@@ -163,17 +191,28 @@ export function AssessmentExperience({
 
   const isLiveMode = mode === 'live'
   const isDemoMode = mode === 'demo'
-  useEffect(() => {
-    if (
-      !isLiveMode ||
-      !session.participant ||
-      configuration?.provider !== 'remote-backend' ||
-      configuration.policy.cameraMonitoring !== true ||
-      !['ready', 'authenticating', 'in_progress'].includes(session.status)
-    ) {
-      setCameraReady(false)
-    }
-  }, [configuration?.id, configuration?.provider, isLiveMode, session.participant, session.status])
+  const cameraReady =
+    isLiveMode &&
+    configuration?.provider === 'remote-backend' &&
+    configuration.policy.cameraMonitoring === true &&
+    Boolean(cameraSessionKey && cameraReadySessionKey === cameraSessionKey) &&
+    ['ready', 'authenticating', 'in_progress'].includes(session.status)
+  const cameraRequired =
+    configuration?.provider === 'remote-backend' && configuration.policy.cameraMonitoring === true
+  const canBeginExam =
+    (!cameraRequired || cameraReady) && (!isLiveMode || session.policyAcknowledged === true)
+  const proctoringSummary =
+    proctoringSummaryState.attemptId === session.attemptId
+      ? proctoringSummaryState.result
+      : undefined
+  const proctoringSummaryLoading =
+    proctoringSummaryState.attemptId === session.attemptId && proctoringSummaryState.loading
+  const handleCameraReadinessChange = useCallback(
+    (ready: boolean): void => {
+      setCameraReadySessionKey(ready ? cameraSessionKey : undefined)
+    },
+    [cameraSessionKey]
+  )
   const activityEvents = session.activityEvents ?? []
   const monitoringActive =
     isLiveMode &&
@@ -267,11 +306,13 @@ export function AssessmentExperience({
       )
       setLastOtpRequestTime(Date.now())
     } catch (error) {
-      setOtpError(
-        error instanceof Error
-          ? error.message
-          : 'Failed to send verification code. Please try again.'
-      )
+      const requestTimedOut =
+        error instanceof Error && error.message.includes('Remote assessment backend timed out.')
+      if (requestTimedOut) {
+        setOtpSent(true)
+        setLastOtpRequestTime(Date.now())
+      }
+      setOtpError(getOtpRequestErrorMessage(error))
     } finally {
       setOtpSending(false)
     }
@@ -292,11 +333,7 @@ export function AssessmentExperience({
       setSession(nextSession)
       setOtpSuccess('Email verified successfully!')
     } catch (error) {
-      setOtpError(
-        error instanceof Error
-          ? error.message
-          : 'Verification failed. Please check the code and try again.'
-      )
+      setOtpError(getOtpErrorMessage(error))
     } finally {
       setOtpVerifying(false)
     }
@@ -311,7 +348,7 @@ export function AssessmentExperience({
   }, [cooldownRemaining, handleSendOtp])
 
   const handleBeginExam = useCallback((): void => {
-    if (!cameraReady || beginningExam) return
+    if (!canBeginExam || beginningExam) return
     setBeginningExam(true)
     setSession((current) => ({ ...current, error: undefined }))
     void window.browser.assessment
@@ -327,25 +364,37 @@ export function AssessmentExperience({
         }))
       })
       .finally(() => setBeginningExam(false))
-  }, [beginningExam, cameraReady])
+  }, [beginningExam, canBeginExam])
 
   const handleGenerateProctoringSummary = useCallback((): void => {
-    if (!monitoringActive || proctoringSummaryLoading) return
-    setProctoringSummaryLoading(true)
+    const attemptId = session.attemptId
+    if (!monitoringActive || !attemptId || proctoringSummaryLoading) return
+    setProctoringSummaryState({ attemptId, loading: true })
     void window.browser.assessment
       .getProctoringInsights()
-      .then(setProctoringSummary)
-      .catch((error: unknown) => {
-        setProctoringSummary({
-          status: 'failed',
-          message:
-            error instanceof Error
-              ? error.message
-              : 'AI summary could not be loaded. Deterministic review rules remain available.'
-        })
+      .then((result) => {
+        setProctoringSummaryState((current) =>
+          current.attemptId === attemptId ? { attemptId, result, loading: false } : current
+        )
       })
-      .finally(() => setProctoringSummaryLoading(false))
-  }, [monitoringActive, proctoringSummaryLoading])
+      .catch((error: unknown) => {
+        setProctoringSummaryState((current) =>
+          current.attemptId === attemptId
+            ? {
+                attemptId,
+                loading: false,
+                result: {
+                  status: 'failed',
+                  message:
+                    error instanceof Error
+                      ? error.message
+                      : 'AI summary could not be loaded. Deterministic review rules remain available.'
+                }
+              }
+            : current
+        )
+      })
+  }, [monitoringActive, proctoringSummaryLoading, session.attemptId])
 
   const handleBackToChoose = useCallback((): void => {
     void window.browser.assessment.cancel().then(() => {
@@ -386,6 +435,7 @@ export function AssessmentExperience({
             onBookmark={() => undefined}
             onPanel={() => undefined}
             onAssessment={() => undefined}
+            onAdmin={() => undefined}
           />
         </div>
       )}
@@ -417,11 +467,29 @@ export function AssessmentExperience({
           {mode !== 'choose' &&
             session.status !== 'in_progress' &&
             session.status !== 'submitting' && (
-              <button className="toolbar-button" onClick={handleBackToChoose}>
+              <button
+                className="toolbar-button"
+                onClick={handleBackToChoose}
+                disabled={Boolean(session.submissionFailure)}
+                title={
+                  session.submissionFailure
+                    ? 'Retry the failed submission before leaving this assessment.'
+                    : undefined
+                }
+              >
                 ← Change mode
               </button>
             )}
-          <button className="toolbar-button" onClick={onExit}>
+          <button
+            className="toolbar-button"
+            onClick={onExit}
+            disabled={session.status === 'submitting' || Boolean(session.submissionFailure)}
+            title={
+              session.submissionFailure
+                ? 'Retry the failed submission before leaving this assessment.'
+                : undefined
+            }
+          >
             Return to browser
           </button>
         </div>
@@ -456,9 +524,9 @@ export function AssessmentExperience({
             </div>
           </div>
           <p className="proctoring-panel-caption">
-            Pearl Browser sends activity events to the assessment backend&apos;s in-memory audit
-            store; backend restarts clear that log. Address-bar search text is not retained.
-            Recognized AI-site visits are informational and do not establish misconduct.
+            Activity metadata is appended to the backend&apos;s local audit log and survives backend
+            restarts. Address-bar search text is not retained. Recognized AI-site visits are
+            informational and do not establish misconduct.
           </p>
           <div className="proctoring-summary" aria-label="Activity event counts">
             <div>
@@ -795,6 +863,22 @@ export function AssessmentExperience({
               <span>Instructions</span>
               <p>{configuration.instructions}</p>
             </div>
+            {isLiveMode && (
+              <label className="assessment-policy-acknowledgement">
+                <input
+                  type="checkbox"
+                  checked={session.policyAcknowledged === true}
+                  onChange={(event) =>
+                    action(window.browser.assessment.acknowledgePolicy(event.target.checked))
+                  }
+                />
+                <span>
+                  I have reviewed these instructions and understand that the assessment may record
+                  browser activity, camera/face-presence signals, and approximate head orientation.
+                  Computer-vision signals can be incorrect and are not proof of misconduct.
+                </span>
+              </label>
+            )}
             <div className="assessment-meta">
               <div className="meta-item">
                 <span className="meta-label">Duration</span>
@@ -826,13 +910,13 @@ export function AssessmentExperience({
             <button
               className="go-button assessment-begin-button"
               onClick={handleBeginExam}
-              disabled={!cameraReady || beginningExam}
+              disabled={!canBeginExam || beginningExam}
             >
               {beginningExam
                 ? 'Starting exam…'
                 : session.attemptId
                   ? 'Retry question loading'
-                  : cameraReady
+                  : canBeginExam
                     ? 'Start Exam'
                     : 'Complete webcam setup to continue'}
             </button>
@@ -846,6 +930,12 @@ export function AssessmentExperience({
           configuration &&
           question && (
             <div className="assessment-workspace">
+              {session.status === 'submitting' && session.automaticSubmissionTrigger && (
+                <div className="assessment-message assessment-message-warning" role="status">
+                  <span className="button-spinner" aria-hidden="true" />
+                  <span>Exam integrity event detected — submitting assessment...</span>
+                </div>
+              )}
               <div className="assessment-progress">
                 <span>
                   Question {session.currentQuestionIndex + 1} of {configuration.questions.length}

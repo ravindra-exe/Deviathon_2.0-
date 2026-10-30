@@ -109,11 +109,47 @@ describe('AssessmentManager', () => {
     expect(questionLoads).toBe(0)
     await manager.authenticate('participant@example.com', '123456')
     expect(questionLoads).toBe(0)
+    await expect(manager.begin()).rejects.toThrow('acknowledge the assessment policy')
+    manager.acknowledgePolicy(true)
     await manager.begin()
 
     expect(questionLoads).toBe(1)
     expect(manager.getState().configuration?.questions).toHaveLength(3)
     expect(manager.getState().status).toBe('in_progress')
+  })
+
+  it('submits automatically at the deadline and retains the deadline trigger for retries', async () => {
+    const clock = new ManualClock()
+    const local = new LocalDemoAssessmentProvider()
+    const triggers: Array<string | undefined> = []
+    let failFirst = true
+    const provider: AssessmentProvider = {
+      getConfiguration: () => local.getConfiguration(),
+      authenticate: (name, code) => local.authenticate(name, code),
+      submitAnswers: async (configuration, answers, attemptId, trigger) => {
+        void attemptId
+        triggers.push(trigger)
+        if (failFirst) {
+          failFirst = false
+          throw new Error('Temporary submission failure.')
+        }
+        return local.submitAnswers(configuration, answers)
+      }
+    }
+    const manager = new Manager(provider, () => undefined, clock)
+    await manager.start()
+    await manager.authenticate('Participant', 'DEMO')
+    await manager.begin()
+
+    clock.advance(10 * 60_000)
+    clock.fireTimers()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(manager.getState().status).toBe('expired')
+    expect(manager.getState().automaticSubmissionTrigger).toBe('deadline')
+
+    const retried = await manager.submit()
+    expect(retried.status).toBe('submitted')
+    expect(triggers).toEqual(['deadline', 'deadline'])
   })
 
   it('keeps OTP request and verification errors on the ready sign-in state', async () => {
@@ -180,7 +216,31 @@ describe('AssessmentManager', () => {
     expect(() => manager.answer(configuration.questions[0].id, 0)).toThrow(
       'Assessment time has expired.'
     )
-    expect(manager.getState().status).toBe('expired')
+    expect(manager.getState().status).toBe('submitting')
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(manager.getState().status).toBe('submitted')
+  })
+
+  it('routes a manual submit at the deadline through the deadline coordinator', async () => {
+    const clock = new ManualClock()
+    const baseProvider = new LocalDemoAssessmentProvider()
+    let receivedTrigger: string | undefined
+    const provider: AssessmentProvider = {
+      getConfiguration: () => baseProvider.getConfiguration(),
+      authenticate: (name, code) => baseProvider.authenticate(name, code),
+      submitAnswers: async (configuration, answers, attemptId, trigger) => {
+        void attemptId
+        receivedTrigger = trigger
+        return baseProvider.submitAnswers(configuration, answers)
+      }
+    }
+    const manager = new Manager(provider, () => undefined, clock)
+    const configuration = await beginAssessment(manager)
+    clock.advance(configuration.policy.durationMinutes * 60_000)
+
+    const submitted = await manager.submit()
+    expect(submitted.status).toBe('submitted')
+    expect(receivedTrigger).toBe('deadline')
   })
 
   it('prevents duplicate submissions while a provider request is pending', async () => {
@@ -199,7 +259,7 @@ describe('AssessmentManager', () => {
 
     const first = manager.submit()
     expect(manager.getState().status).toBe('submitting')
-    await expect(manager.submit()).rejects.toThrow('submitting')
+    expect(manager.submit()).toBe(first)
     resolveSubmission!({
       id: 'submission-1',
       submittedAt: new Date().toISOString(),
@@ -210,14 +270,97 @@ describe('AssessmentManager', () => {
     expect(manager.getState().events.filter((event) => event.type === 'submitted')).toHaveLength(1)
   })
 
+  it('records automatic integrity triggers and submits the latest answers only once', async () => {
+    const baseProvider = new LocalDemoAssessmentProvider()
+    const configuration = await baseProvider.getConfiguration()
+    const recordedTypes: string[] = []
+    let submissions = 0
+    const provider: AssessmentProvider = {
+      getConfiguration: async () => ({
+        ...configuration,
+        provider: 'remote-backend'
+      }),
+      authenticate: (displayName, demoCode) => baseProvider.authenticate(displayName, demoCode),
+      startAttempt: async () => ({ attemptId: 'live-attempt-for-test' }),
+      recordActivityEvent: async (event) => {
+        recordedTypes.push(event.type)
+        return { id: `event-${recordedTypes.length}`, occurredAt: new Date().toISOString() }
+      },
+      submitAnswers: async (assessment, answers) => {
+        submissions += 1
+        expect(answers).toEqual([{ questionId: assessment.questions[0].id, optionIndex: 2 }])
+        return baseProvider.submitAnswers(assessment, answers)
+      }
+    }
+    const manager = new Manager(provider, () => undefined)
+    await manager.start()
+    await manager.authenticate('Participant', 'DEMO')
+    manager.acknowledgePolicy(true)
+    await manager.begin()
+    manager.answer(configuration.questions[0].id, 2)
+
+    const focusLoss = manager.submit('focus_loss')
+    const duplicateFocusLoss = manager.submit('focus_loss')
+    const minimized = manager.submit('minimized')
+    const [submitted] = await Promise.all([focusLoss, duplicateFocusLoss, minimized])
+
+    expect(submitted.status).toBe('submitted')
+    expect(submissions).toBe(1)
+    expect(recordedTypes).toContain('automatic_submission_focus_loss')
+    expect(recordedTypes).toContain('automatic_submission_minimized')
+    expect(recordedTypes.filter((type) => type === 'automatic_submission_focus_loss')).toHaveLength(
+      1
+    )
+    expect(submitted.automaticSubmissionTrigger).toBe('focus_loss')
+  })
+
+  it('does not wait for activity storage before sending automatic submissions', async () => {
+    const baseProvider = new LocalDemoAssessmentProvider()
+    const configuration = await baseProvider.getConfiguration()
+    let resolveActivity: (() => void) | undefined
+    let submissionStarted = false
+    const provider: AssessmentProvider = {
+      getConfiguration: async () => ({
+        ...configuration,
+        provider: 'remote-backend'
+      }),
+      authenticate: (displayName, demoCode) => baseProvider.authenticate(displayName, demoCode),
+      startAttempt: async () => ({ attemptId: 'live-attempt-with-slow-audit' }),
+      recordActivityEvent: () =>
+        new Promise((resolve) => {
+          resolveActivity = () =>
+            resolve({ id: 'slow-audit-event', occurredAt: new Date().toISOString() })
+        }),
+      submitAnswers: async (assessment, answers) => {
+        submissionStarted = true
+        return baseProvider.submitAnswers(assessment, answers)
+      }
+    }
+    const manager = new Manager(provider, () => undefined)
+    await manager.start()
+    await manager.authenticate('Participant', 'DEMO')
+    manager.acknowledgePolicy(true)
+    await manager.begin()
+
+    const submission = manager.submit('focus_loss')
+    await Promise.resolve()
+
+    expect(submissionStarted).toBe(true)
+    expect(manager.getState().status).toBe('submitting')
+    resolveActivity?.()
+    expect((await submission).status).toBe('submitted')
+  })
+
   it('records a recoverable failed submission and clears the expiration timer', async () => {
     const clock = new ManualClock()
     const manager = new Manager(new FailingSubmissionProvider(), () => undefined, clock)
     await beginAssessment(manager)
 
     const failed = await manager.submit()
-    expect(failed.status).toBe('failed')
+    expect(failed.status).toBe('in_progress')
     expect(failed.error).toContain('Demo provider is unavailable.')
+    expect(failed.submissionFailure).toContain('Demo provider is unavailable.')
+    await expect(manager.cancel()).rejects.toThrow('Retry the failed submission')
     expect(failed.events.map((event) => event.type)).toContain('failed')
   })
 

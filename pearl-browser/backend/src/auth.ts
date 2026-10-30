@@ -8,6 +8,7 @@ export interface AuthIdentity {
   assessmentId: string
   sessionId: string
   expiresAt: string
+  role: 'participant' | 'administrator'
 }
 export interface AuthSession extends AuthIdentity {
   token: string
@@ -24,16 +25,22 @@ interface OtpRecord {
 
 interface SessionRecord extends AuthIdentity {
   tokenDigest: Buffer
+  attemptId?: string
+  attemptCreationPending?: boolean
 }
 
 export class AuthError extends Error {
   constructor(
-    readonly code: 'invalid' | 'rate_limit' | 'configuration' | 'expired',
-    message: string
+    readonly code:
+      'invalid' | 'unauthorized' | 'rate_limit' | 'configuration' | 'expired' | 'conflict',
+    message: string,
+    readonly diagnosticReason?: string
   ) {
     super(message)
   }
 }
+
+const ADMIN_SCOPE = '__pearl_admin__'
 
 export class OtpAuthService {
   private readonly otps = new Map<string, OtpRecord>()
@@ -45,17 +52,45 @@ export class OtpAuthService {
     private readonly assessmentService: AssessmentService,
     private readonly delivery: OtpDelivery,
     private readonly secret: string,
-    private readonly clock: () => number = Date.now
+    private readonly clock: () => number = Date.now,
+    adminEmails: readonly string[] = []
   ) {
+    this.adminEmails = new Set(adminEmails.map(normalizeEmail).filter(isEmail))
     if (!secret.trim())
       throw new AuthError('configuration', 'OTP authentication is not configured.')
   }
 
+  private readonly adminEmails: ReadonlySet<string>
+
   async requestOtp(emailInput: string, assessmentId: string, ip: string): Promise<void> {
     const email = normalizeEmail(emailInput)
     if (!isEmail(email) || !isIdentifier(assessmentId))
-      throw new AuthError('invalid', 'Invalid authentication request.')
+      throw new AuthError('invalid', 'Invalid authentication request.', 'invalid_request')
     await this.assessmentService.getPublishedAssessment(assessmentId)
+    await this.issueOtp(email, assessmentId, ip)
+  }
+
+  async requestAdminOtp(emailInput: string, ip: string): Promise<void> {
+    const email = normalizeEmail(emailInput)
+    this.checkRate(this.ipRequests, ip)
+    if (!isEmail(email)) {
+      this.recordRate(this.ipRequests, ip)
+      throw new AuthError('invalid', 'Enter a valid administrator email address.')
+    }
+    this.checkRate(this.emailRequests, email)
+    if (!this.adminEmails.has(email)) {
+      this.recordRate(this.emailRequests, email)
+      this.recordRate(this.ipRequests, ip)
+      throw new AuthError(
+        'unauthorized',
+        'This email address is not authorized for the Admin Console.',
+        'admin_not_allowed'
+      )
+    }
+    await this.issueOtp(email, ADMIN_SCOPE, ip)
+  }
+
+  private async issueOtp(email: string, assessmentId: string, ip: string): Promise<void> {
     this.cleanup()
     this.checkRate(this.emailRequests, email)
     this.checkRate(this.ipRequests, ip)
@@ -79,21 +114,74 @@ export class OtpAuthService {
       await this.delivery.send({ email, assessmentId, code, expiresAt: new Date(record.expiresAt) })
     } catch {
       this.otps.delete(this.otpKey(email, assessmentId))
-      throw new AuthError('configuration', 'Authentication delivery is unavailable.')
+      throw new AuthError(
+        'configuration',
+        'Authentication delivery is unavailable.',
+        'mail_delivery_failed'
+      )
     }
   }
 
   verifyOtp(emailInput: string, assessmentId: string, code: string): AuthSession {
+    return this.verifyScopedOtp(emailInput, assessmentId, code, 'participant')
+  }
+
+  verifyAdminOtp(emailInput: string, code: string): AuthSession {
+    const email = normalizeEmail(emailInput)
+    if (!isEmail(email) || !this.adminEmails.has(email)) {
+      throw new AuthError('invalid', 'Authentication failed.', 'admin_not_allowed')
+    }
+    return this.verifyScopedOtp(email, ADMIN_SCOPE, code, 'administrator')
+  }
+
+  private verifyScopedOtp(
+    emailInput: string,
+    assessmentId: string,
+    code: string,
+    role: AuthIdentity['role']
+  ): AuthSession {
     const email = normalizeEmail(emailInput)
     const record = this.otps.get(this.otpKey(email, assessmentId))
-    if (!record || !/^\d{6}$/.test(code) || this.clock() >= record.expiresAt) {
-      throw new AuthError('invalid', 'Authentication failed.')
+    if (!record) {
+      throw new AuthError('invalid', 'Authentication failed.', 'challenge_missing')
+    }
+    if (!/^\d{6}$/.test(code)) {
+      throw new AuthError('invalid', 'Authentication failed.', 'malformed_code')
+    }
+    if (this.clock() >= record.expiresAt) {
+      this.otps.delete(this.otpKey(email, assessmentId))
+      throw new AuthError('invalid', 'Authentication failed.', 'challenge_expired')
     }
     const digest = this.digest(code)
     record.attempts += 1
-    if (record.attempts > 5 || !timingSafeEqual(record.digest, digest)) {
+    if (record.attempts > 5) {
+      this.otps.delete(this.otpKey(email, assessmentId))
+      throw new AuthError('invalid', 'Authentication failed.', 'attempt_limit')
+    }
+    if (!timingSafeEqual(record.digest, digest)) {
       if (record.attempts >= 5) this.otps.delete(this.otpKey(email, assessmentId))
-      throw new AuthError('invalid', 'Authentication failed.')
+      throw new AuthError(
+        'invalid',
+        'Authentication failed.',
+        record.attempts >= 5 ? 'attempt_limit' : 'code_mismatch'
+      )
+    }
+    this.cleanup()
+    if (
+      [...this.sessions.values()].some(
+        (session) =>
+          session.email === email &&
+          session.assessmentId === assessmentId &&
+          session.role === role &&
+          this.clock() < Date.parse(session.expiresAt)
+      )
+    ) {
+      this.otps.delete(this.otpKey(email, assessmentId))
+      throw new AuthError(
+        'conflict',
+        'An active assessment session already exists for this account.',
+        'active_session'
+      )
     }
     this.otps.delete(this.otpKey(email, assessmentId))
     const token = randomBytes(32).toString('base64url')
@@ -104,9 +192,18 @@ export class OtpAuthService {
       participantId: `email-${createHash('sha256').update(email).digest('hex').slice(0, 24)}`,
       assessmentId,
       sessionId,
-      expiresAt
+      expiresAt,
+      role
     }
-    this.sessions.set(sessionId, { ...identity, tokenDigest: this.digest(token) })
+    try {
+      this.sessions.set(sessionId, { ...identity, tokenDigest: this.digest(token) })
+    } catch {
+      throw new AuthError(
+        'configuration',
+        'Authentication session could not be created.',
+        'session_creation_failed'
+      )
+    }
     return { ...identity, token }
   }
 
@@ -130,6 +227,14 @@ export class OtpAuthService {
     return this.authorize(value, '')
   }
 
+  authorizeAdmin(value: string | undefined): AuthIdentity {
+    const identity = this.authorize(value, ADMIN_SCOPE)
+    if (identity.role !== 'administrator' || !this.adminEmails.has(identity.email)) {
+      throw new AuthError('invalid', 'Authentication is invalid or expired.')
+    }
+    return identity
+  }
+
   logout(value: string | undefined): void {
     const [id] = value?.split('.') ?? []
     if (id) this.sessions.delete(id)
@@ -139,8 +244,32 @@ export class OtpAuthService {
     const [id] = value?.split('.') ?? []
     const record = id ? this.sessions.get(id) : undefined
     if (!record) throw new AuthError('invalid', 'Authentication is invalid or expired.')
-    ;(record as SessionRecord & { attemptId?: string }).attemptId = attemptId
+    if (record.attemptId && record.attemptId !== attemptId) {
+      throw new AuthError('conflict', 'This session is already bound to an assessment attempt.')
+    }
+    record.attemptId = attemptId
+    record.attemptCreationPending = false
     return { ...record }
+  }
+
+  reserveAttemptCreation(value: string | undefined, assessmentId: string): AuthIdentity {
+    const identity = this.authorize(value, assessmentId)
+    const record = this.sessions.get(identity.sessionId)
+    if (!record || record.attemptId || record.attemptCreationPending) {
+      throw new AuthError(
+        'conflict',
+        'This session already has an assessment attempt.',
+        'attempt_already_bound'
+      )
+    }
+    record.attemptCreationPending = true
+    return identity
+  }
+
+  releaseAttemptCreation(value: string | undefined): void {
+    const [id] = value?.split('.') ?? []
+    const record = id ? this.sessions.get(id) : undefined
+    if (record && !record.attemptId) record.attemptCreationPending = false
   }
 
   authorizeAttempt(
@@ -150,9 +279,7 @@ export class OtpAuthService {
   ): AuthIdentity {
     const identity = this.authorize(value, assessmentId)
     const [id] = value?.split('.') ?? []
-    const record = id
-      ? (this.sessions.get(id) as (SessionRecord & { attemptId?: string }) | undefined)
-      : undefined
+    const record = id ? this.sessions.get(id) : undefined
     if (!record || record.attemptId !== attemptId)
       throw new AuthError('invalid', 'Authentication is invalid or expired.')
     return identity

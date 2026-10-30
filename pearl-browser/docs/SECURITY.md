@@ -29,9 +29,8 @@ operating-system applications or external devices.
 The optional Airtable integration keeps the PAT exclusively in the separate
 backend process. The backend validates assessment publication, active
 questions, attempt ownership, answer indexes, server-side deadlines, and
-idempotent submissions before writing records. It still does not provide
-production participant authentication, CSRF/origin policy, or deployment
-hardening; those remain required before real examinations.
+idempotent submissions before writing records. It still requires deployment
+hardening and production monitoring before real examinations.
 
 Development remote mode uses a backend-generated short-lived bearer token bound
 to one assessment and one attempt. The token is stored hashed in backend
@@ -41,10 +40,20 @@ integration testing and is disabled in production; it is not participant
 identity verification. Production OTP/OIDC or equivalent authentication is a
 release-blocking requirement.
 
-Email OTP authentication is now available for remote assessments. OTP codes
-use cryptographic randomness, are stored only as keyed hashes, expire after
-five minutes, are single-use, and allow five failed attempts. SMTP credentials
+Email OTP authentication is available for remote assessments. OTP codes use
+cryptographic randomness, are stored only as keyed hashes, expire after five
+minutes, are single-use, and allow five failed attempts. SMTP credentials
 remain backend-only. Opaque session credentials are assessment-scoped, held in
-backend memory, and revoked on logout or restart. Email OTP proves mailbox
-control, not participant enrollment or legal identity; an enrollment roster
-and durable production session controls remain required.
+backend memory, and revoked on logout or restart. The backend rejects a second
+active session for the same email and assessment and binds each session to at
+most one attempt. Email OTP proves mailbox control, not participant enrollment
+or legal identity; an enrollment roster and durable production session controls
+remain required.
+
+Structured proctoring events are persisted locally as append-only JSON Lines in
+`backend-data/proctoring-events.jsonl` by default, or at the path configured by
+`PEARL_AUDIT_LOG_PATH`. The log contains assessment/attempt IDs and sanitized
+event metadata, not images, recordings, or search text. The backend process
+account and storage location must be access-controlled, backed up, and retained
+according to the deployment's privacy policy. A failed disk write is returned
+as an event-storage failure; it is not reported as successfully recorded.

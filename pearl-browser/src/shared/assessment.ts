@@ -8,6 +8,8 @@ export type AssessmentStatus =
   | 'expired'
   | 'failed'
 
+export type AutomaticSubmissionTrigger = 'focus_loss' | 'minimized' | 'close_attempt' | 'deadline'
+
 export interface AssessmentPolicy {
   allowedHosts: string[]
   blockedHosts?: string[]
@@ -83,6 +85,15 @@ export type AssessmentActivityEventType =
   | 'face_detected'
   | 'multiple_faces_detected'
   | 'camera_disconnected'
+  | 'attention_monitoring_started'
+  | 'sustained_head_turn_left'
+  | 'sustained_head_turn_right'
+  | 'sustained_head_down'
+  | 'attention_returned'
+  | 'automatic_submission_focus_loss'
+  | 'automatic_submission_minimized'
+  | 'automatic_submission_close_attempt'
+  | 'automatic_submission_deadline'
 
 export interface AssessmentActivityEvent {
   type: AssessmentActivityEventType
@@ -116,9 +127,31 @@ export interface ProctoringInsightObservation {
   uncertainty: string
 }
 
+export interface ProctoringInsightEventFact {
+  eventId: string
+  type: string
+  occurredAt: string
+  observationCount?: number
+  observationDurationMs?: number
+  confidence?: number
+}
+
+export interface ProctoringInsightRiskIndicator {
+  text: string
+  evidenceEventIds: string[]
+}
+
 export interface ProctoringInsightResult {
   status: 'not_configured' | 'available' | 'failed'
   message: string
+  provider?: string
+  model?: string
+  summary?: string
+  observedFacts?: ProctoringInsightEventFact[]
+  supportingEventIds?: string[]
+  riskIndicators?: ProctoringInsightRiskIndicator[]
+  confidenceLimitations?: string[]
+  reviewerRecommendations?: string[]
   observations?: ProctoringInsightObservation[]
 }
 
@@ -148,8 +181,11 @@ export interface AssessmentSession {
   deadline?: string
   attemptId?: string
   submission?: AssessmentSubmission
+  submissionFailure?: string
+  automaticSubmissionTrigger?: AutomaticSubmissionTrigger
   events: AssessmentEvent[]
   activityEvents: AssessmentActivityLogEntry[]
+  policyAcknowledged?: boolean
   error?: string
 }
 
@@ -166,6 +202,7 @@ export interface AssessmentAPI {
   recordActivityEvent(event: AssessmentActivityEvent): Promise<void>
   setCameraConsent(consented: boolean): Promise<void>
   setCameraReadiness(ready: boolean): Promise<void>
+  acknowledgePolicy(acknowledged: boolean): Promise<AssessmentSession>
   getProctoringInsights(): Promise<ProctoringInsightResult>
   onStateChange(listener: (state: AssessmentSession) => void): () => void
 }

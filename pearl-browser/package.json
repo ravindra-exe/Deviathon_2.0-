@@ -19,6 +19,7 @@
     "test:airtable:live": "tsx backend/scripts/airtable-live-smoke.ts",
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
+    "dev:live": "node scripts/dev-live.mjs",
     "build": "npm run typecheck && electron-vite build",
     "postinstall": "install-electron && electron-builder install-app-deps",
     "build:unpack": "npm run build && electron-builder --dir",
@@ -29,6 +30,7 @@
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
+    "@google/genai": "^2.32.0",
     "@mediapipe/tasks-vision": "^1.2.0",
     "dotenv": "^17.4.2",
     "fastify": "^5.12.7",

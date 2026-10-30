@@ -3,7 +3,12 @@ import { join } from 'node:path'
 import { config as loadDotenv } from 'dotenv'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import type { BrowserCommand, BrowserState } from '../shared/browser'
-import type { AssessmentActivityEvent, AssessmentSession } from '../shared/assessment'
+import type { AdminAssessmentDraft, AdminQuestionGenerationRequest } from '../shared/admin'
+import type {
+  AssessmentActivityEvent,
+  AssessmentSession,
+  AutomaticSubmissionTrigger
+} from '../shared/assessment'
 import { isBrowserCommand } from './browser/CommandValidation'
 import { DownloadManager } from './browser/DownloadManager'
 import { BrowserDataService } from './browser/BrowserDataService'
@@ -13,8 +18,13 @@ import { TabManager } from './browser/TabManager'
 import type { BrowserShortcut } from './browser/TabManager'
 import { calculateBrowserLayout } from './browser/Layout'
 import { AssessmentManager } from './browser/AssessmentManager'
+import { AdminConsoleClient } from './browser/AdminConsoleClient'
 import { LocalDemoAssessmentProvider } from './browser/AssessmentProvider'
 import { RemoteAssessmentProvider } from './browser/RemoteAssessmentProvider'
+import { guardBrokenOutputPipe } from '../shared/safeProcessOutput'
+
+guardBrokenOutputPipe(process.stdout)
+guardBrokenOutputPipe(process.stderr)
 
 let mainWindow: BaseWindow | undefined
 let chromeView: WebContentsView | undefined
@@ -24,6 +34,7 @@ let downloads: DownloadManager | undefined
 let navigation: NavigationService | undefined
 let browserData: BrowserDataService | undefined
 let assessment: AssessmentManager | undefined
+let adminConsoleClient: AdminConsoleClient | undefined
 let liveAssessment: AssessmentManager | undefined
 let demoAssessment: AssessmentManager | undefined
 let assessmentSurfaceVisible = false
@@ -32,6 +43,44 @@ let cameraConsentSessionKey: string | undefined
 let cameraPermissionSessionKey: string | undefined
 let cameraReadySessionKey: string | undefined
 let assessmentBeginInFlight = false
+let focusLossTimer: NodeJS.Timeout | undefined
+let allowWindowClose = false
+let closeSubmissionInFlight = false
+
+function getFocusLossDebounceMs(): number {
+  const configured = process.env['PEARL_AUTO_SUBMIT_FOCUS_LOSS_MS']
+  if (configured === undefined) return 1_000
+  const milliseconds = Number(configured)
+  if (Number.isInteger(milliseconds) && milliseconds >= 100 && milliseconds <= 30_000) {
+    return milliseconds
+  }
+  console.warn(
+    'PEARL_AUTO_SUBMIT_FOCUS_LOSS_MS must be an integer from 100 to 30000; using 1000 ms.'
+  )
+  return 1_000
+}
+
+function clearFocusLossTimer(): void {
+  if (focusLossTimer) clearTimeout(focusLossTimer)
+  focusLossTimer = undefined
+}
+
+function canAutoSubmitAssessment(): boolean {
+  if (assessment !== liveAssessment || !assessment) return false
+  const status = assessment.getState().status
+  return status === 'in_progress' || status === 'submitting'
+}
+
+function autoSubmit(trigger: AutomaticSubmissionTrigger): Promise<AssessmentSession> {
+  const manager = assessment
+  if (!manager) return Promise.reject(new Error('Assessment is not ready'))
+  if (manager !== liveAssessment) return Promise.resolve(manager.getState())
+  const status = manager.getState().status
+  if (status !== 'in_progress' && status !== 'submitting') {
+    return Promise.resolve(manager.getState())
+  }
+  return manager.submit(trigger)
+}
 
 function getLiveCameraSessionKey(state: AssessmentSession): string | undefined {
   const configuration = state.configuration
@@ -60,6 +109,9 @@ function isChromeSender(event: Electron.IpcMainInvokeEvent): boolean {
 
 function createWindow(): void {
   if (!persistence) throw new Error('Persistence is not initialized')
+  const focusLossDebounceMs = getFocusLossDebounceMs()
+  allowWindowClose = false
+  closeSubmissionInFlight = false
   const saved = persistence.snapshot
   navigation = new NavigationService(saved.preferences.searchEngineId)
   browserData = new BrowserDataService(persistence, navigation)
@@ -171,7 +223,47 @@ function createWindow(): void {
     tabs?.resize(width, height)
   }
   mainWindow.on('resize', updateBounds)
+  mainWindow.on('blur', () => {
+    clearFocusLossTimer()
+    if (!canAutoSubmitAssessment()) return
+    focusLossTimer = setTimeout(() => {
+      focusLossTimer = undefined
+      void autoSubmit('focus_loss').catch((error: unknown) => {
+        console.error('Automatic submission after focus loss failed:', error)
+      })
+    }, focusLossDebounceMs)
+  })
+  mainWindow.on('focus', clearFocusLossTimer)
+  mainWindow.on('minimize', () => {
+    clearFocusLossTimer()
+    void autoSubmit('minimized').catch((error: unknown) => {
+      console.error('Automatic submission after minimization failed:', error)
+    })
+  })
+  mainWindow.on('close', (event) => {
+    if (allowWindowClose || !canAutoSubmitAssessment() || closeSubmissionInFlight) {
+      if (!allowWindowClose && canAutoSubmitAssessment()) event.preventDefault()
+      return
+    }
+    event.preventDefault()
+    closeSubmissionInFlight = true
+    clearFocusLossTimer()
+    void autoSubmit('close_attempt')
+      .then((state) => {
+        if (state.status === 'submitted' && mainWindow) {
+          allowWindowClose = true
+          mainWindow.close()
+        }
+      })
+      .catch((error: unknown) => {
+        console.error('Automatic submission after a close attempt failed:', error)
+      })
+      .finally(() => {
+        closeSubmissionInFlight = false
+      })
+  })
   mainWindow.on('closed', () => {
+    clearFocusLossTimer()
     if (persistence && tabs && persistence.snapshot.preferences.restoreSession) {
       persistence.update((data) => {
         data.session = tabs?.getRestorableSession() ?? { urls: [] }
@@ -238,6 +330,99 @@ function getAssessment(): AssessmentManager {
   return assessment
 }
 
+function getAdminConsoleClient(): AdminConsoleClient {
+  if (!adminConsoleClient) {
+    adminConsoleClient = new AdminConsoleClient(process.env['PEARL_ASSESSMENT_BACKEND_URL'] ?? '')
+  }
+  return adminConsoleClient
+}
+
+ipcMain.handle('admin:open', (event) => {
+  if (!isChromeSender(event) || !mainWindow || !chromeView) {
+    throw new Error('Unauthorized Admin Console request')
+  }
+  assessmentSurfaceVisible = true
+  mainWindow.contentView.addChildView(chromeView)
+})
+
+ipcMain.handle('admin:close', (event) => {
+  if (!isChromeSender(event) || !tabs) throw new Error('Unauthorized Admin Console request')
+  assessmentSurfaceVisible = false
+  tabs.bringViewsToFront()
+})
+
+ipcMain.handle('admin:request-otp', async (event, email: unknown) => {
+  if (!isChromeSender(event) || typeof email !== 'string' || email.length > 254) {
+    throw new Error('Invalid administrator authentication request')
+  }
+  return getAdminConsoleClient().requestOtp(email)
+})
+
+ipcMain.handle('admin:verify-otp', async (event, email: unknown, code: unknown) => {
+  if (
+    !isChromeSender(event) ||
+    typeof email !== 'string' ||
+    email.length > 254 ||
+    typeof code !== 'string' ||
+    code.length !== 6
+  ) {
+    throw new Error('Invalid administrator authentication request')
+  }
+  return getAdminConsoleClient().verifyOtp(email, code)
+})
+
+ipcMain.handle('admin:resume', (event) => {
+  if (!isChromeSender(event)) throw new Error('Unauthorized Admin Console request')
+  return getAdminConsoleClient().resume()
+})
+
+ipcMain.handle('admin:get-data', (event) => {
+  if (!isChromeSender(event)) throw new Error('Unauthorized Admin Console data request')
+  return getAdminConsoleClient().getData()
+})
+
+ipcMain.handle('admin:generate-questions', (event, request: AdminQuestionGenerationRequest) => {
+  if (!isChromeSender(event)) throw new Error('Unauthorized Admin Console request')
+  return getAdminConsoleClient().generateQuestions(request)
+})
+
+ipcMain.handle('admin:save-assessment-draft', (event, draft: AdminAssessmentDraft) => {
+  if (!isChromeSender(event)) throw new Error('Unauthorized Admin Console request')
+  return getAdminConsoleClient().saveAssessmentDraft(draft)
+})
+
+ipcMain.handle('admin:publish-assessment', (event, assessmentId: unknown) => {
+  if (!isChromeSender(event) || typeof assessmentId !== 'string' || assessmentId.length > 128) {
+    throw new Error('Invalid administrator publication request')
+  }
+  return getAdminConsoleClient().publishAssessment(assessmentId)
+})
+
+ipcMain.handle('admin:get-insights', (event, attemptId: unknown, assessmentId: unknown) => {
+  if (
+    !isChromeSender(event) ||
+    typeof attemptId !== 'string' ||
+    attemptId.length > 128 ||
+    typeof assessmentId !== 'string' ||
+    assessmentId.length > 128
+  ) {
+    throw new Error('Invalid administrator insight request')
+  }
+  return getAdminConsoleClient().getInsights(attemptId, assessmentId)
+})
+
+ipcMain.handle('admin:record-export', (event, targetId: unknown) => {
+  if (!isChromeSender(event) || (targetId !== 'attempts' && targetId !== 'events')) {
+    throw new Error('Invalid administrator report export request')
+  }
+  return getAdminConsoleClient().recordExport(targetId)
+})
+
+ipcMain.handle('admin:logout', async (event) => {
+  if (!isChromeSender(event)) throw new Error('Unauthorized Admin Console request')
+  return getAdminConsoleClient().logout()
+})
+
 function isActivityEvent(value: unknown): value is AssessmentActivityEvent {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const event = value as Record<string, unknown>
@@ -260,7 +445,16 @@ function isActivityEvent(value: unknown): value is AssessmentActivityEvent {
     'face_not_detected',
     'face_detected',
     'multiple_faces_detected',
-    'camera_disconnected'
+    'camera_disconnected',
+    'attention_monitoring_started',
+    'sustained_head_turn_left',
+    'sustained_head_turn_right',
+    'sustained_head_down',
+    'attention_returned',
+    'automatic_submission_focus_loss',
+    'automatic_submission_minimized',
+    'automatic_submission_close_attempt',
+    'automatic_submission_deadline'
   ]
   if (typeof event.type !== 'string' || !types.includes(event.type)) return false
   const allowedKeys = new Set([
@@ -296,7 +490,12 @@ function isActivityEvent(value: unknown): value is AssessmentActivityEvent {
 }
 
 function isCameraActivityEvent(value: AssessmentActivityEvent): boolean {
-  return value.type.startsWith('camera_') || value.type.startsWith('face_')
+  return (
+    value.type.startsWith('camera_') ||
+    value.type.startsWith('face_') ||
+    value.type.startsWith('attention_') ||
+    value.type.startsWith('sustained_head_')
+  )
 }
 
 ipcMain.handle('assessment:get-state', (event) => {
@@ -323,7 +522,14 @@ ipcMain.handle(
     ) {
       throw new Error('Invalid assessment authentication request')
     }
-    return getAssessment().authenticate(displayName.slice(0, 100), demoCode.slice(0, 32))
+    try {
+      return await getAssessment().authenticate(displayName.slice(0, 100), demoCode.slice(0, 32))
+    } catch (error) {
+      console.warn(
+        `[assessment] OTP verification IPC failed; errorType=${error instanceof Error ? error.name : 'unknown'}`
+      )
+      throw error
+    }
   }
 )
 ipcMain.handle('assessment:request-otp', async (event, email: unknown) => {
@@ -391,6 +597,9 @@ ipcMain.handle('assessment:record-activity', async (event, value: unknown) => {
   if (!isAssessmentSender(event) || !isActivityEvent(value)) {
     throw new Error('Invalid assessment activity event')
   }
+  if (value.type.startsWith('automatic_submission_')) {
+    throw new Error('Automatic submission events can only be recorded by the main process.')
+  }
   if (isCameraActivityEvent(value)) {
     const state = liveAssessment?.getState()
     if (
@@ -452,6 +661,16 @@ ipcMain.handle('assessment:set-camera-readiness', (event, ready: unknown) => {
     throw new Error('Camera and detector readiness could not be confirmed for this live session.')
   }
   cameraReadySessionKey = sessionKey
+})
+
+ipcMain.handle('assessment:acknowledge-policy', (event, acknowledged: unknown) => {
+  if (!isAssessmentSender(event) || typeof acknowledged !== 'boolean') {
+    throw new Error('Invalid assessment policy acknowledgement')
+  }
+  if (assessment !== liveAssessment) {
+    throw new Error('Policy acknowledgement is only required for an authenticated live assessment.')
+  }
+  return getAssessment().acknowledgePolicy(acknowledged)
 })
 
 ipcMain.handle('assessment:get-proctoring-insights', (event) => {
